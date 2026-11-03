@@ -499,7 +499,11 @@ export class AssetLoader {
 			}
 
 			const key = ref.substring(1);
-			const next: unknown = model.textures?.[key];
+			// unwrap {sprite} objects BOTH at entry and after #ref dereference —
+			// a face ref like #line can land on {"sprite": "...", "force_translucent": true}
+			const nextRaw: unknown = model.textures?.[key];
+			const next: unknown =
+				typeof nextRaw === "object" && nextRaw !== null ? (nextRaw as any).sprite : nextRaw;
 			if (typeof next === "string" && next.length > 0) ref = next;
 			else {
 				console.warn(`Model texture ref ${ref} resolves to a non-string; using missing texture.`);
