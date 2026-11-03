@@ -421,12 +421,18 @@ export class RenderManager {
 		WebGPURenderer = webgpuModule.WebGPURenderer;
 		_PostProcessing = webgpuModule.PostProcessing;
 
-		// Try to import Inspector
-		try {
-			const inspectorModule = await import("three/examples/jsm/inspector/Inspector.js");
-			Inspector = inspectorModule.Inspector;
-		} catch (e) {
-			console.warn("[RenderManager] Three.js Inspector not available:", e);
+		// Import the three.js Inspector ONLY when explicitly enabled: it is a
+		// debugging tool whose bundled pointer handlers throw InvalidStateError
+		// (unguarded setPointerCapture) when a pointerdown races control
+		// reconfiguration — consumer-reported intermittent fly-mode breakage.
+		// Default off keeps the chunk out of production entirely.
+		if (this.schematicRenderer.options.debugOptions?.enableInspector) {
+			try {
+				const inspectorModule = await import("three/examples/jsm/inspector/Inspector.js");
+				Inspector = inspectorModule.Inspector;
+			} catch (e) {
+				console.warn("[RenderManager] Three.js Inspector not available:", e);
+			}
 		}
 
 		this.renderer = new WebGPURenderer({

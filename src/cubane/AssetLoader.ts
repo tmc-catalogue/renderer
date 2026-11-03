@@ -469,7 +469,10 @@ export class AssetLoader {
 	 * Resolve a texture reference in a model
 	 */
 	public resolveTexture(textureRef: string, model: BlockModel): string {
-		if (!textureRef || textureRef === "#missing") {
+		// consumer-reported crash: modern model JSONs carry non-string values in
+		// texture positions (e.g. shade_direction_override numerics) — guard before
+		// any .startsWith, those faces fall back to the missing texture
+		if (typeof textureRef !== "string" || textureRef === "#missing") {
 			return "block/missing_texture";
 		}
 
@@ -491,7 +494,12 @@ export class AssetLoader {
 			}
 
 			const key = ref.substring(1);
-			ref = model.textures[key] || ref;
+			const next: unknown = model.textures?.[key];
+			if (typeof next === "string" && next.length > 0) ref = next;
+			else {
+				console.warn(`Model texture ref ${ref} resolves to a non-string; using missing texture.`);
+				return "block/missing_texture";
+			}
 			depth++;
 		}
 

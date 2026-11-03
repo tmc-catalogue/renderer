@@ -90,12 +90,23 @@ export class SchematicViewer {
 			} as any
 		);
 		this.renderer = renderer as any;
-		// controls flavor: "fly" is the FPS mouse-look; "shulkr"/"orbit" map to the
-		// smooth orbit preset (shulkr-style tweaks layer on via renderer options)
-		const controlType = this.options.controls === "fps" ? "fly" : "orbit";
-		// (superseded: config only — the app tick drives damping)
+		// controls flavor (consumer-reported: this option was accepted but never
+		// wired — enableShulkrControls had zero call sites, so every consumer got
+		// plain orbit regardless of the option):
+		//   "shulkr" (default) = smooth orbit + WASD via the ShulkrControls layer
+		//   "orbit"             = plain orbit only
+		//   "fps"               = fly controls with pointer-lock mouse look
+		const flavor: ViewerControls = this.options.controls ?? "shulkr";
 		try {
-			renderer.cameraManager.switchControls(controlType as any);
+			const cm: any = renderer.cameraManager;
+			if (flavor === "fps") {
+				cm.switchControls("fly");
+				cm.initializeFlyControls();
+			} else {
+				cm.switchControls("orbit");
+				if (flavor === "shulkr") cm.enableShulkrControls();
+				else cm.disableShulkrControls?.();
+			}
 		} catch {
 			/* presets optional */
 		}
