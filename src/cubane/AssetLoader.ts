@@ -468,10 +468,15 @@ export class AssetLoader {
 	/**
 	 * Resolve a texture reference in a model
 	 */
-	public resolveTexture(textureRef: string, model: BlockModel): string {
-		// consumer-reported crash: modern model JSONs carry non-string values in
-		// texture positions (e.g. shade_direction_override numerics) — guard before
-		// any .startsWith, those faces fall back to the missing texture
+	public resolveTexture(
+		textureRef: string | { sprite?: string } | unknown,
+		model: BlockModel
+	): string {
+		// modern model JSONs: texture values may be objects — {"sprite": "..."} —
+		// or non-strings entirely (shade_direction_override numerics). Normalize
+		// the sprite form, fall back to missing for anything else.
+		if (typeof textureRef === "object" && textureRef !== null && "sprite" in (textureRef as any))
+			textureRef = (textureRef as any).sprite;
 		if (typeof textureRef !== "string" || textureRef === "#missing") {
 			return "block/missing_texture";
 		}
@@ -1246,7 +1251,9 @@ export class AssetLoader {
 							try {
 								const m = JSON.parse(await zip.file(mf)!.async("string"));
 								if (m && m.textures) {
-									for (const v of Object.values(m.textures)) {
+									for (const raw of Object.values(m.textures)) {
+										// modern models use object refs: {"sprite": "...", "force_translucent": true}
+										const v = typeof raw === "object" && raw !== null ? (raw as any).sprite : raw;
 										if (typeof v === "string" && !v.startsWith("#"))
 											referenced.add(v.replace(/^minecraft:/, ""));
 									}
