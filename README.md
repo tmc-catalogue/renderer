@@ -33,17 +33,30 @@ The easiest way to use the renderer is to include the UMD build directly. This f
 <script src="dist/schematic-renderer.umd.js"></script>
 ```
 
-### Method 2: NPM Package
+### Method 2: NPM Package (from GitHub)
 
 If you are using a bundler like Vite, Webpack, or Rollup:
 
 ```bash
-npm install schematic-renderer
-# or
-yarn add schematic-renderer
-# or
-bun add schematic-renderer
+npm install github:worldInColors/renderer
+# pnpm and yarn work the same way — no build-script allowlist needed anymore
 ```
+
+The WASM mesher is bundled inline (async-chunked) — no `.wasm` asset
+configuration, works in Vite dev and prod builds with zero setup.
+
+**Required:** the vanilla texture pack must be served statically. It ships
+inside the package — copy it to your public directory:
+
+```bash
+cp node_modules/schematic-renderer/dist/pack.zip public/pack.zip
+# optional Redstone Tweaks overlay:
+cp node_modules/schematic-renderer/dist/packs/redstone-tweaks.zip public/packs/ 2>/dev/null || true
+```
+
+then pass `vanillaPackUrl: "/pack.zip"`. Without it the viewer renders with
+placeholder textures. Replacing the pack on your server propagates to all
+returning visitors automatically (hash-compared each boot).
 
 ## Basic Usage
 

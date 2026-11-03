@@ -32,7 +32,8 @@
 			"import": "./dist/schematic-renderer.es.js",
 			"require": "./dist/schematic-renderer.umd.js",
 			"types": "./dist/index.d.ts"
-		}
+		},
+		"./pack.zip": "./dist/pack.zip"
 	},
 	"files": [
 		"dist"
@@ -52,8 +53,8 @@
 		"format:check": "prettier --check \"src/**/*.ts\"",
 		"typecheck": "tsc --noEmit",
 		"typecheck:build": "tsc --project tsconfig.build.json --noEmit",
-		"prepare": "husky",
-		"watch-wasm": "node watch-wasm.js"
+		"watch-wasm": "node watch-wasm.js",
+		"husky:install": "husky"
 	},
 	"lint-staged": {
 		"src/**/*.ts": [

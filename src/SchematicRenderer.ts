@@ -1,4 +1,10 @@
 import initializeNucleationWasm from "nucleation";
+// The wasm blob, inlined at build time (vite.config's wasmInlinePlugin turns the
+// import into a base64 data URL). Feeding it to init() explicitly bypasses
+// nucleation's default `new URL('nucleation_bg.wasm', import.meta.url)` fetch,
+// which 404s under consumer bundlers (Vite dev prebundling mangles the URL) —
+// reported by a real consumer install. Async-chunked so the main bundle stays lean.
+// (loaded via dynamic import at init time so it lands in its own chunk)
 
 import * as THREE from "three";
 import { CameraManager } from "./managers/CameraManager";
@@ -290,9 +296,11 @@ export class SchematicRenderer {
 			showProgress("Loading assets...", 0.15);
 			const wasmReady = SchematicRenderer.isNucleationInitialized
 				? Promise.resolve()
-				: initializeNucleationWasm().then(() => {
-						SchematicRenderer.isNucleationInitialized = true;
-					});
+				: import("../node_modules/nucleation/nucleation_bg.wasm")
+						.then((m) => initializeNucleationWasm((m as { default: string }).default))
+						.then(() => {
+							SchematicRenderer.isNucleationInitialized = true;
+						});
 			const packsReady = this.options.context
 				? Promise.resolve()
 				: this.initializeResourcePacks(defaultResourcePacks);
