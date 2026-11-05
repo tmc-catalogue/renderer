@@ -63,6 +63,8 @@ export class AssetLoader {
 	 * Connect to a ResourcePackManager for managed pack loading
 	 */
 	public setPackManager(manager: ResourcePackManager): void {
+		this.invalidateFluidFrames();
+		this.stringCache.clear();
 		this.packManager = manager;
 		this.usePackManager = true;
 
@@ -200,6 +202,7 @@ export class AssetLoader {
 			const packId = `pack_${Date.now()}`;
 			this.resourcePacks.set(packId, zip);
 			this.resourcePackOrder.unshift(packId);
+			this.stringCache.clear();
 			this.invalidateFluidFrames();
 		} catch (error) {
 			console.error("❌ Failed to load resource pack:", error);
@@ -1225,7 +1228,14 @@ export class AssetLoader {
 
 	/** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
 	private loadFluidFrames(): Promise<void> {
-		if (this.fluidFramesLoad) return this.fluidFramesLoad.promise;
+		if (this.fluidFramesLoad) {
+			const load = this.fluidFramesLoad;
+			return load.promise.then(() => {
+				// Other Cubane instances share the registry, but own their textures.
+				if (this.fluidFramesLoad === load && load.registry)
+					Object.assign(load.registry, load.textures);
+			});
+		}
 		const load: NonNullable<AssetLoader["fluidFramesLoad"]> = {
 			promise: Promise.resolve(),
 			textures: {},

@@ -5,6 +5,8 @@ import { AssetLoader } from "./AssetLoader";
 import { InstancedBlockRenderer } from "../InstancedBlockRenderer";
 import { liquidFrameTextures } from "../meshing/RecordRenderer";
 import { createFluidMaterial, setFluidTextures, updateFluidTime } from "../meshing/WaterMesher";
+import { fluidAnimationFrame } from "../meshing/FluidAnimation";
+import type { ResourcePackManager } from "./ResourcePackManager";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -120,11 +122,14 @@ describe("lava rendering", () => {
 		const decoded = new Promise((resolve) => {
 			finish = resolve;
 		});
-		const started = Promise.withResolvers<void>();
+		let onDecode!: () => void;
+		const started = new Promise<void>((resolve) => {
+			onDecode = resolve;
+		});
 		vi.stubGlobal(
 			"createImageBitmap",
 			vi.fn(() => {
-				started.resolve();
+				onDecode();
 				return decoded;
 			})
 		);
@@ -133,12 +138,88 @@ describe("lava rendering", () => {
 			getImageData: () => ({ data: new Uint8ClampedArray(4) }),
 		} as any);
 		const load = loader.buildTextureAtlas();
-		await started.promise;
+		await started;
 		loader.dispose();
 		finish({ width: 1, height: 1, close: vi.fn() });
 		await load;
 		expect(Object.values(liquidFrameTextures).every((value) => value === null)).toBe(true);
 	});
+
+	it("restores a cached loader's textures after another loader is disposed without decoding again", async () => {
+		vi.stubGlobal(
+			"createImageBitmap",
+			vi.fn().mockResolvedValue({ width: 1, height: 1, close: vi.fn() })
+		);
+		vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+			drawImage: vi.fn(),
+			getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+		} as any);
+		const loaders = [new AssetLoader(false), new AssetLoader(false)];
+		for (const loader of loaders) {
+			(loader as any).textureAtlas = new THREE.Texture();
+			vi.spyOn(loader as any, "loadColormaps").mockResolvedValue(undefined);
+			vi.spyOn(loader, "getResourceBlob").mockImplementation(async (path) =>
+				path.includes("lava_still") ? new Blob(["lava"]) : undefined
+			);
+			vi.spyOn(loader, "getResourceString").mockResolvedValue(undefined);
+		}
+		await loaders[0].buildTextureAtlas();
+		const first = liquidFrameTextures.lava;
+		const disposed = vi.fn();
+		first!.addEventListener("dispose", disposed);
+		await loaders[1].buildTextureAtlas();
+		expect(liquidFrameTextures.lava).not.toBe(first);
+		loaders[1].dispose();
+		expect(liquidFrameTextures.lava).toBeNull();
+		await loaders[0].buildTextureAtlas();
+		expect(liquidFrameTextures.lava).toBe(first);
+		expect(disposed).not.toHaveBeenCalled();
+		expect(createImageBitmap).toHaveBeenCalledTimes(2);
+		loaders[0].dispose();
+		expect(disposed).toHaveBeenCalledOnce();
+	});
+
+	it.each(["direct", "managed"])(
+		"reloads animation metadata when a %s pack replaces cached fluid frames",
+		async (source) => {
+			const loader = new AssetLoader(false);
+			(loader as any).textureAtlas = new THREE.Texture();
+			vi.spyOn(loader as any, "loadColormaps").mockResolvedValue(undefined);
+			vi.spyOn(loader, "getResourceBlob").mockImplementation(async (path) =>
+				path.includes("lava_still") ? new Blob(["lava"]) : undefined
+			);
+			vi.stubGlobal(
+				"createImageBitmap",
+				vi.fn().mockResolvedValue({ width: 1, height: 2, close: vi.fn() })
+			);
+			vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+				drawImage: vi.fn(),
+				getImageData: () => ({ data: new Uint8ClampedArray(8) }),
+			} as any);
+			for (const frametime of [2, 8]) {
+				const zip = new JSZip().file(
+					"assets/minecraft/textures/block/lava_still.png.mcmeta",
+					JSON.stringify({ animation: { frametime } })
+				);
+				if (source === "managed" && frametime === 8) {
+					loader.setPackManager({
+						getEnabledPacksInOrder: () => [{ id: "managed", zip }],
+						setAtlasRebuildCallback: vi.fn(),
+					} as unknown as ResourcePackManager);
+				} else {
+					await loader.loadResourcePack(
+						new Blob([await zip.generateAsync({ type: "arraybuffer" })])
+					);
+				}
+				await loader.buildTextureAtlas();
+				expect(fluidAnimationFrame(liquidFrameTextures.lava!, 0.15).x).toBe(
+					frametime === 2 ? 1 : 0
+				);
+			}
+			expect(createImageBitmap).toHaveBeenCalledTimes(2);
+			loader.dispose();
+		}
+	);
 
 	it.each(["initializeInstancedMeshes", "initializeInstancedMeshesMerged"] as const)(
 		"keeps lava opaque and preserves water alpha through %s",
