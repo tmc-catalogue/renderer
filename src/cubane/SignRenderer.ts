@@ -99,8 +99,25 @@ export class SignRenderer {
 	private fontPromise: Promise<void> | null = null;
 	private basePixelCache = new Map<string, ImageData | null>();
 	private textureCache = new Map<string, THREE.Texture>();
+	private cacheGeneration = 0;
+	private disposed = false;
 
 	constructor(private assetLoader: AssetLoader) {}
+
+	/** Sign pixels, fonts and baked canvases all depend on the active resource pack. */
+	public clearCache(): void {
+		this.cacheGeneration++;
+		this.textureCache.forEach((texture) => texture.dispose());
+		this.textureCache.clear();
+		this.basePixelCache.clear();
+		this.fontData = null;
+		this.fontPromise = null;
+	}
+
+	public dispose(): void {
+		this.disposed = true;
+		this.clearCache();
+	}
 
 	/** Whether a block id (e.g. "minecraft:oak_wall_sign") is any kind of sign. */
 	public isSign(blockName: string): boolean {
@@ -117,11 +134,39 @@ export class SignRenderer {
 		properties: Record<string, string>,
 		nbtData?: Record<string, any>
 	): Promise<THREE.Object3D | null> {
+		while (!this.disposed) {
+			const generation = this.cacheGeneration;
+			let mesh: THREE.Object3D | null;
+			try {
+				mesh = await this.buildSignMeshForPack(blockName, properties, nbtData);
+			} catch (error) {
+				if (generation !== this.cacheGeneration) continue;
+				throw error;
+			}
+			if (generation === this.cacheGeneration) return mesh;
+			// A pack switch finished while decoding. Discard the obsolete mesh and retry.
+			mesh?.traverse((part) => {
+				if (!(part instanceof THREE.Mesh)) return;
+				part.geometry.dispose();
+				for (const material of Array.isArray(part.material) ? part.material : [part.material])
+					material.dispose();
+			});
+		}
+		return null;
+	}
+
+	private async buildSignMeshForPack(
+		blockName: string,
+		properties: Record<string, string>,
+		nbtData?: Record<string, any>
+	): Promise<THREE.Object3D | null> {
 		const info = this.detectSign(blockName, properties);
 		if (!info) return null;
 
 		// Modern packs provide block models and block textures, including attached chains.
-		if (!(await this.getBasePixels(info.texturePath))) {
+		const legacyPixels = await this.getBasePixels(info.texturePath);
+		if (this.disposed) return null;
+		if (!legacyPixels) {
 			return this.buildModernSign(blockName, properties, nbtData ?? {}, info);
 		}
 		const parts = this.buildParts(info);
@@ -129,7 +174,10 @@ export class SignRenderer {
 
 		const { lines, color, glowing } = this.extractSignText(nbtData ?? {});
 		const texture = await this.getSignTexture(info, lines, color, glowing);
-		if (!texture) return null;
+		if (!texture) {
+			geometry.dispose();
+			return null;
+		}
 
 		const material = new THREE.MeshStandardMaterial({
 			map: texture,
@@ -155,9 +203,11 @@ export class SignRenderer {
 		nbt: Record<string, any>,
 		info: SignInfo
 	): Promise<THREE.Object3D | null> {
+		if (this.disposed) return null;
+		const generation = this.cacheGeneration;
 		const texturePath = `block/${info.wood}_${info.isHanging ? "hanging_sign" : "sign"}`;
 		const base = await this.getBasePixels(texturePath);
-		if (!base) return null;
+		if (!base || this.disposed) return null;
 		const front = this.extractSignText(nbt);
 		const back = this.extractSignText({ front_text: nbt.back_text ?? nbt.Text?.back_text });
 		const key = JSON.stringify([texturePath, front, back]);
@@ -179,6 +229,7 @@ export class SignRenderer {
 				[frontRegion],
 				[{ ...back, regions: [backRegion] }]
 			);
+			if (generation !== this.cacheGeneration || this.disposed) return null;
 			texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
 			texture.magFilter = THREE.NearestFilter;
 			texture.minFilter = THREE.NearestFilter;
@@ -560,13 +611,15 @@ export class SignRenderer {
 		color: string,
 		glowing: boolean
 	): Promise<THREE.Texture | null> {
+		if (this.disposed) return null;
+		const generation = this.cacheGeneration;
 		const hasText = lines.some((l) => l.trim() !== "");
 		const cacheKey = `${info.texturePath}|${info.isHanging}|${info.isWall}|${color}|${glowing}|${hasText ? lines.join(" ") : ""}`;
 		const cached = this.textureCache.get(cacheKey);
 		if (cached) return cached;
 
 		const base = await this.getBasePixels(info.texturePath);
-		if (!base) return null;
+		if (!base || this.disposed) return null;
 
 		let canvas: HTMLCanvasElement | OffscreenCanvas;
 		if (!hasText) {
@@ -575,6 +628,7 @@ export class SignRenderer {
 			canvas = await this.compositeSignWithText(base, info, lines, color, glowing);
 		}
 
+		if (generation !== this.cacheGeneration || this.disposed) return null;
 		const texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
 		texture.flipY = false; // canvas top-left origin matches our top-left UVs
 		texture.magFilter = THREE.NearestFilter;
@@ -590,9 +644,12 @@ export class SignRenderer {
 	}
 
 	private async getBasePixels(texturePath: string): Promise<ImageData | null> {
+		if (this.disposed) return null;
 		if (this.basePixelCache.has(texturePath)) return this.basePixelCache.get(texturePath)!;
+		const generation = this.cacheGeneration;
 		const data = await this.assetLoader.getTexturePixels(texturePath);
-		this.basePixelCache.set(texturePath, data);
+		if (!this.disposed && generation === this.cacheGeneration)
+			this.basePixelCache.set(texturePath, data);
 		return data;
 	}
 
@@ -616,11 +673,13 @@ export class SignRenderer {
 	// ── Text compositing (port of sign_text.rs) ─────────────────────────────────
 
 	private async ensureFont(): Promise<void> {
+		if (this.disposed) return;
 		if (this.fontData) return;
 		if (!this.fontPromise) {
+			const generation = this.cacheGeneration;
 			this.fontPromise = (async () => {
 				const tex = await this.assetLoader.getTexturePixels("font/ascii");
-				if (!tex) return;
+				if (!tex || this.disposed || generation !== this.cacheGeneration) return;
 				const width = tex.width;
 				const height = tex.height;
 				const cellW = Math.floor(width / 16);

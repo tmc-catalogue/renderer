@@ -978,6 +978,7 @@ export class Cubane {
 	 * Clear all mesh caches
 	 */
 	public clearMeshCaches(): void {
+		this.signRenderer.clearCache();
 		this.blockMeshCache.clear();
 		this.entityMeshCache.clear();
 		this.optimizationDataCache.clear();
@@ -1397,5 +1398,6 @@ export class Cubane {
 	public dispose(): void {
 		this.assetLoader.dispose();
 		this.clearMeshCaches();
+		this.signRenderer.dispose();
 	}
 }
