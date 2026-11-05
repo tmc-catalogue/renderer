@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import poses from "./CopperGolemPoses.json";
 import type { ChestAssetLoaderLike } from "./ChestModels";
+import { mergeOwnedStaticModelParts } from "./StaticModelParts";
 
 /** Static entity-model poses, in Minecraft's pixel units (Y down).
  * CopperGolemPoses contains the vanilla 26.3 model dimensions and part transforms.
@@ -79,5 +80,6 @@ export async function buildCopperGolemStatue(
 		}
 	}
 	group.name = `copper_golem_statue:${pose ?? "standing"}`;
+	mergeOwnedStaticModelParts(group);
 	return group;
 }

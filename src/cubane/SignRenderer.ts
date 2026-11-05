@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { AssetLoader } from "./AssetLoader";
 import { ModelResolver } from "./ModelResolver";
 import { BlockMeshBuilder } from "./BlockMeshBuilder";
+import { mergeOwnedStaticModelParts } from "../meshing/StaticModelParts";
 
 /**
  * Vanilla-accurate sign rendering for cubane.
@@ -169,24 +170,14 @@ export class SignRenderer {
 			const backRegion: [number, number, number, number] = info.isHanging
 				? [36, 32, 28, 20]
 				: [0, 32, 48, 24];
-			const frontCanvas = await this.compositeSignWithText(
+			const canvas = await this.compositeSignWithText(
 				base,
 				info,
 				front.lines,
 				front.color,
 				front.glowing,
-				[frontRegion]
-			);
-			const ctx = frontCanvas.getContext("2d") as CanvasRenderingContext2D;
-			const pixels = ctx.getImageData(0, 0, frontCanvas.width, frontCanvas.height);
-			const canvas = await this.compositeSignWithText(
-				pixels,
-				info,
-				back.lines,
-				back.color,
-				back.glowing,
-				[backRegion],
-				1
+				[frontRegion],
+				[{ ...back, regions: [backRegion] }]
 			);
 			texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
 			texture.magFilter = THREE.NearestFilter;
@@ -217,6 +208,7 @@ export class SignRenderer {
 			);
 			group.add(part);
 		}
+		mergeOwnedStaticModelParts(group);
 		return group;
 	}
 
@@ -666,9 +658,15 @@ export class SignRenderer {
 		color: string,
 		glowing: boolean,
 		customRegions?: [number, number, number, number][],
-		scale = 4
+		additionalText: {
+			lines: string[];
+			color: string;
+			glowing: boolean;
+			regions: [number, number, number, number][];
+		}[] = []
 	): Promise<HTMLCanvasElement | OffscreenCanvas> {
 		await this.ensureFont();
+		const scale = 4;
 		const outW = base.width * scale;
 		const outH = base.height * scale;
 		const out = new Uint8ClampedArray(outW * outH * 4);
@@ -704,57 +702,59 @@ export class SignRenderer {
 							]
 						: [[2, 2, 24, 12]]);
 
-			const nonEmpty = Math.max(
-				1,
-				lines.slice(0, 4).filter((l) => l !== "" && l.trim() !== "").length
-			);
-
-			// Regions are in the 64×32 *layout*; the actual sign texture may be higher
-			// resolution (HD packs use 128×64, 256×128, …). `px` converts layout pixels
-			// to base-texture pixels so the text lands where the board's UVs sample,
-			// instead of being squished into a corner (which doubled it onto one face).
-			const px = base.width / SIGN_TEXTURE_SIZE[0];
-
-			for (const [rx, ry, rw, rh] of regions) {
-				const textX0 = Math.round(rx * px * scale);
-				const textY0 = Math.round(ry * px * scale);
-				const textW = Math.round(rw * px * scale);
-				const textH = Math.round(rh * px * scale);
-				const lineHeight = Math.floor(textH / 4);
-				const glyphScale = Math.max(
+			const textSides = [{ lines, color, glowing, regions }, ...additionalText];
+			for (const { lines, color, glowing, regions: sideRegions } of textSides) {
+				const nonEmpty = Math.max(
 					1,
-					Math.floor(Math.min(lineHeight, Math.floor((font.cellH * scale) / 2)) / font.cellH)
+					lines.slice(0, 4).filter((l) => l !== "" && l.trim() !== "").length
 				);
-				const vOffset = Math.floor((Math.max(0, 4 - nonEmpty) * lineHeight) / 2);
 
-				let visibleIdx = 0;
-				for (const line of lines.slice(0, 4)) {
-					if (line === "" || line.trim() === "") continue;
-					const yStart = textY0 + vOffset + visibleIdx * lineHeight;
-					visibleIdx++;
+				// Regions are in the 64×32 *layout*; the actual sign texture may be higher
+				// resolution (HD packs use 128×64, 256×128, …). `px` converts layout pixels
+				// to base-texture pixels so the text lands where the board's UVs sample,
+				// instead of being squished into a corner (which doubled it onto one face).
+				const px = base.width / SIGN_TEXTURE_SIZE[0];
 
-					const segments = this.parseTextComponent(line, color);
-					if (segments.length === 0) continue;
-
-					const totalWidth = this.segmentsWidth(segments, font, glyphScale);
-					const xOffset =
-						totalWidth < textW ? textX0 + Math.floor((textW - totalWidth) / 2) : textX0;
-
-					this.renderSegments(
-						out,
-						outW,
-						font,
-						glyphScale,
-						segments,
-						xOffset,
-						yStart,
-						textX0 + textW,
-						glowing
+				for (const [rx, ry, rw, rh] of sideRegions) {
+					const textX0 = Math.round(rx * px * scale);
+					const textY0 = Math.round(ry * px * scale);
+					const textW = Math.round(rw * px * scale);
+					const textH = Math.round(rh * px * scale);
+					const lineHeight = Math.floor(textH / 4);
+					const glyphScale = Math.max(
+						1,
+						Math.floor(Math.min(lineHeight, Math.floor((font.cellH * scale) / 2)) / font.cellH)
 					);
+					const vOffset = Math.floor((Math.max(0, 4 - nonEmpty) * lineHeight) / 2);
+
+					let visibleIdx = 0;
+					for (const line of lines.slice(0, 4)) {
+						if (line === "" || line.trim() === "") continue;
+						const yStart = textY0 + vOffset + visibleIdx * lineHeight;
+						visibleIdx++;
+
+						const segments = this.parseTextComponent(line, color);
+						if (segments.length === 0) continue;
+
+						const totalWidth = this.segmentsWidth(segments, font, glyphScale);
+						const xOffset =
+							totalWidth < textW ? textX0 + Math.floor((textW - totalWidth) / 2) : textX0;
+
+						this.renderSegments(
+							out,
+							outW,
+							font,
+							glyphScale,
+							segments,
+							xOffset,
+							yStart,
+							textX0 + textW,
+							glowing
+						);
+					}
 				}
 			}
 		}
-
 		const canvas = this.makeCanvas(outW, outH);
 		const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
 		ctx.putImageData(new ImageData(out, outW, outH), 0, 0);

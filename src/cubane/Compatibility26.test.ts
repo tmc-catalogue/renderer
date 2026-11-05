@@ -135,6 +135,10 @@ describe("26.3 resource-pack compatibility", () => {
 					);
 					expect(pack.file(`assets/minecraft/textures/${path}.png`)).not.toBeNull();
 					const bounds = new THREE.Box3().setFromObject(group);
+					expect(group.children).toHaveLength(1);
+					expect((group.children[0] as THREE.Mesh).geometry.index!.count).toBe(
+						(pose === "sitting" ? 11 : 9) * 36
+					);
 					silhouettes.add(JSON.stringify(bounds));
 					expect(bounds.max.y).toBeGreaterThan(0.5);
 					for (const child of group.children as THREE.Mesh[]) {
@@ -217,69 +221,86 @@ describe("26.3 resource-pack compatibility", () => {
 		expect(materials.filter((m) => m.emissive.getHex() === 0)).toHaveLength(4);
 		for (const m of materials.filter((m) => m.emissive.getHex())) expect(m.emissiveMap).toBe(m.map);
 	});
-	it("renders modern sign models with independent front/back text instead of falling back to blank boards", async () => {
-		const canvases = new WeakMap<HTMLCanvasElement, ImageData>();
-		const context = vi
-			.spyOn(HTMLCanvasElement.prototype, "getContext")
-			.mockImplementation(function (this: HTMLCanvasElement) {
-				return {
-					putImageData: (data: ImageData) => canvases.set(this, data),
-					getImageData: () => canvases.get(this)!,
-				} as unknown as CanvasRenderingContext2D;
-			} as unknown as HTMLCanvasElement["getContext"]);
-		try {
-			const assets = new AssetLoader();
-			assets.getBlockState = (name) => json(`blockstates/${name}`);
-			assets.getModel = async (name) => {
-				const model = await json(`models/${name.replace("minecraft:", "")}`);
-				if (!model.parent) return model;
-				const parent = await assets.getModel(model.parent);
-				return {
-					...parent,
-					...model,
-					elements: model.elements ?? parent.elements,
-					textures: { ...parent.textures, ...model.textures },
+	it.each([32, 128])(
+		"renders equal-sized front/back sign text in one canvas pass for %ipx packs",
+		async (signSize) => {
+			const canvases = new WeakMap<HTMLCanvasElement, ImageData>();
+			const context = vi
+				.spyOn(HTMLCanvasElement.prototype, "getContext")
+				.mockImplementation(function (this: HTMLCanvasElement) {
+					return {
+						putImageData: (data: ImageData) => canvases.set(this, data),
+						getImageData: () => canvases.get(this)!,
+					} as unknown as CanvasRenderingContext2D;
+				} as unknown as HTMLCanvasElement["getContext"]);
+			try {
+				const assets = new AssetLoader();
+				assets.getBlockState = (name) => json(`blockstates/${name}`);
+				assets.getModel = async (name) => {
+					const model = await json(`models/${name.replace("minecraft:", "")}`);
+					if (!model.parent) return model;
+					const parent = await assets.getModel(model.parent);
+					return {
+						...parent,
+						...model,
+						elements: model.elements ?? parent.elements,
+						textures: { ...parent.textures, ...model.textures },
+					};
 				};
-			};
-			assets.getTexture = async () => new THREE.Texture();
-			assets.getTexturePixels = async (path) => {
-				if (path.startsWith("entity/")) return null;
-				const size = path === "font/ascii" ? 128 : 32;
-				return new ImageData(new Uint8ClampedArray(size * size * 4).fill(255), size, size);
-			};
-			const signs = new SignRenderer(assets);
-			for (const wood of ["pale_oak", "poplar"])
-				for (const kind of ["sign", "wall_sign", "hanging_sign", "wall_hanging_sign"]) {
-					const mesh = await signs.buildSignMesh(
-						`minecraft:${wood}_${kind}`,
-						{ rotation: "3", facing: "east", attached: "true" },
-						{
-							front_text: { messages: ['{"text":"FRONT"}'], color: "black" },
-							back_text: { messages: ['{"text":"BACK"}'], color: "blue" },
+				assets.getTexture = async () => new THREE.Texture();
+				assets.getTexturePixels = async (path) => {
+					if (path.startsWith("entity/")) return null;
+					const size = path === "font/ascii" ? 128 : signSize;
+					return new ImageData(new Uint8ClampedArray(size * size * 4).fill(255), size, size);
+				};
+				const signs = new SignRenderer(assets);
+				for (const wood of ["pale_oak", "poplar"])
+					for (const kind of ["sign", "wall_sign", "hanging_sign", "wall_hanging_sign"]) {
+						const mesh = await signs.buildSignMesh(
+							`minecraft:${wood}_${kind}`,
+							{ rotation: "3", facing: "east", attached: "true" },
+							{
+								front_text: { messages: ['{"text":"TEXT"}'], color: "black" },
+								back_text: { messages: ['{"text":"TEXT"}'], color: "blue" },
+							}
+						);
+						expect(mesh).not.toBeNull();
+						let pixels: ImageData | undefined;
+						let meshCount = 0;
+						mesh!.traverse((o) => {
+							if (o instanceof THREE.Mesh) {
+								meshCount++;
+								pixels = canvases.get(
+									(o.material as THREE.MeshStandardMaterial).map!.image as HTMLCanvasElement
+								);
+							}
+						});
+						expect(meshCount).toBeLessThanOrEqual(2);
+						expect(pixels).toBeDefined();
+						let blackPixels = 0,
+							bluePixels = 0;
+						for (let i = 0; i < pixels!.data.length; i += 4) {
+							const [r, g, b] = pixels!.data.subarray(i, i + 3);
+							if (r === 0 && g === 0 && b === 0) blackPixels++;
+							if (b > r && b > g) bluePixels++;
 						}
-					);
-					expect(mesh).not.toBeNull();
-					let pixels: ImageData | undefined;
-					mesh!.traverse((o) => {
-						if (o instanceof THREE.Mesh)
-							pixels = canvases.get(
-								(o.material as THREE.MeshStandardMaterial).map!.image as HTMLCanvasElement
-							);
-					});
-					expect(pixels).toBeDefined();
-					const colors = new Set<string>();
-					for (let i = 0; i < pixels!.data.length; i += 4)
-						colors.add([...pixels!.data.slice(i, i + 3)].join(","));
-					expect(colors.has("0,0,0")).toBe(true);
-					expect(
-						[...colors].some((c) => {
-							const [r, g, b] = c.split(",").map(Number);
-							return b > r && b > g;
-						})
-					).toBe(true);
-				}
-		} finally {
-			context.mockRestore();
+						expect(blackPixels).toBeGreaterThan(0);
+						expect(bluePixels).toBe(blackPixels);
+						const colors = new Set<string>();
+						for (let i = 0; i < pixels!.data.length; i += 4)
+							colors.add([...pixels!.data.slice(i, i + 3)].join(","));
+						expect(colors.has("0,0,0")).toBe(true);
+						expect(
+							[...colors].some((c) => {
+								const [r, g, b] = c.split(",").map(Number);
+								return b > r && b > g;
+							})
+						).toBe(true);
+					}
+				expect(context).toHaveBeenCalledTimes(4); // Wall variants reuse the same four baked textures.
+			} finally {
+				context.mockRestore();
+			}
 		}
-	});
+	);
 });
