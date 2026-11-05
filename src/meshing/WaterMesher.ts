@@ -478,7 +478,7 @@ export function createFluidMaterial(kind: FluidKind, _logged = false): THREE.Sha
 	// framebuffer out, no conversions) — the Color constructor converts hex to
 	// LINEAR working space, which collapsed the tint's luminance and rendered
 	// the surface near-black ("really dark water")
-	const tint = new THREE.Color(p.tint).convertLinearToSRGB();
+	const tint = new THREE.Color(water ? p.tint : 0xff6600).convertLinearToSRGB();
 	const mat = new THREE.ShaderMaterial({
 		glslVersion: THREE.GLSL3,
 		vertexShader: FLUID_VERT,
@@ -557,7 +557,13 @@ function textureStats(tex: THREE.DataArrayTexture): { mean: number; std: number 
 function tryBind(m: THREE.ShaderMaterial): void {
 	const src: FluidTextures | undefined = textureSource ?? (globalThis as any).liquidFrameTextures;
 	const tex = src?.[m.userData.kind as FluidKind];
-	if (!tex) return;
+	if (!tex) {
+		m.uniforms.uTex.value = null;
+		m.uniforms.uFlowTex.value = null;
+		m.uniforms.uHasTex.value = 0;
+		m.userData.bound = false;
+		return;
+	}
 	if (m.userData.kind === "water") {
 		const flow = src?.waterFlow ?? tex;
 		if (m.uniforms.uTex.value === tex && m.uniforms.uFlowTex.value === flow) return;
@@ -569,7 +575,7 @@ function tryBind(m: THREE.ShaderMaterial): void {
 		m.userData.bound = true;
 		return;
 	}
-	if (m.userData.bound) return;
+	if (m.userData.bound && m.uniforms.uTex.value === tex) return;
 	const p = PRESETS[m.userData.kind as FluidKind];
 	// convertLinearToSRGB: the pipeline is sRGB end-to-end (sRGB texels in, sRGB
 	// framebuffer out, no conversions) — the Color constructor converts hex to

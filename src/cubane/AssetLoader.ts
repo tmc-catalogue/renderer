@@ -5,7 +5,7 @@ import { TintManager } from "./TintManager";
 import { BlockModel, BlockStateDefinition } from "./types";
 import { AtlasBuilder } from "./AtlasBuilder";
 import { ResourcePackManager } from "./ResourcePackManager";
-import { createWaterFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
+import { createFluidFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
 
 export class AssetLoader {
 	private resourcePacks: Map<string, JSZip> = new Map();
@@ -35,7 +35,7 @@ export class AssetLoader {
 	// layout rules, liquid frame harvests) — the pack hash alone can't see code
 	// generations, so stale atlases served across upgrades (the "yellow water"
 	// class of bug: new code sampling an old-layout cache)
-	private static readonly ATLAS_FORMAT_VERSION = 2;
+	private static readonly ATLAS_FORMAT_VERSION = 3;
 	private resourcePackHash: string = "";
 	private cacheEnabled: boolean = true;
 
@@ -998,7 +998,9 @@ export class AssetLoader {
 			if (options.isWater) {
 				materialOptions.opacity = options.opacity ?? WATER_OPACITY;
 			} else if (options.isLava) {
-				materialOptions.opacity = 0.9;
+				materialOptions.transparent = false;
+				materialOptions.depthWrite = true;
+				materialOptions.opacity = 1;
 				materialOptions.emissive = new THREE.Color(0x331100);
 			}
 		}
@@ -1189,10 +1191,43 @@ export class AssetLoader {
 		tex.anisotropy = 8; // clamped to the renderer's max at upload; kills grazing-angle arcs
 	}
 
+	/** Fluid arrays are separate from the atlas and must also load on an atlas cache hit. */
+	private async loadFluidFrames(): Promise<void> {
+		const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
+		for (const [key, path] of [
+			["water", "water_still"],
+			["waterFlow", "water_flow"],
+			["lava", "lava_still"],
+		] as const) {
+			const blob = await this.getResourceBlob(`textures/block/${path}.png`);
+			let frames: THREE.DataArrayTexture | null = null;
+			if (blob) {
+				const image = await createImageBitmap(blob);
+				try {
+					const canvas = document.createElement("canvas");
+					canvas.width = image.width;
+					canvas.height = image.height;
+					const context = canvas.getContext("2d", { willReadFrequently: true });
+					if (context) {
+						context.drawImage(image, 0, 0);
+						const pixels = context.getImageData(0, 0, image.width, image.height).data;
+						if (key !== "lava") tintWaterPixels(pixels);
+						frames = createFluidFrameTexture(pixels, image.width, image.height);
+					}
+				} finally {
+					image.close?.();
+				}
+			}
+			liquidFrameTextures[key]?.dispose();
+			liquidFrameTextures[key] = frames;
+		}
+	}
+
 	public async buildTextureAtlas(): Promise<THREE.Texture> {
 		// Colormaps are independent of the atlas; load them before the early-return
 		// so biome tints are available even when the atlas is served from cache.
 		await this.loadColormaps();
+		await this.loadFluidFrames();
 
 		if (this.textureAtlas) return this.textureAtlas;
 
@@ -1346,11 +1381,9 @@ export class AssetLoader {
 						const blob = await this.getResourceBlob(`textures/${path}.png`);
 						if (!blob) return null;
 
-						// Keep the full animation strip in the atlas and harvest repeatable
-						// water frames for the surface shader. Preserve native color/alpha.
+						// Preserve lava's native pixels; only water needs a biome tint.
 						const image = await createImageBitmap(blob);
-						if (/^block\/(water|lava)_/.test(path)) {
-							const isWater = path.includes("water");
+						if (path.startsWith("block/water_")) {
 							const c = document.createElement("canvas");
 							c.width = image.width;
 							c.height = image.height;
@@ -1358,104 +1391,11 @@ export class AssetLoader {
 							if (!cx) return { path, image };
 							cx.drawImage(image, 0, 0);
 							const id = cx.getImageData(0, 0, c.width, c.height);
-							const d = id.data;
-							if (isWater) {
-								tintWaterPixels(d);
-								cx.putImageData(id, 0, 0);
-								const frames = createWaterFrameTexture(d, c.width, c.height);
-								const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
-								liquidFrameTextures[path.endsWith("_flow") ? "waterFlow" : "water"] = frames;
-								const tinted = await createImageBitmap(c);
-								image.close?.();
-								return { path, image: tinted };
-							}
-							let mono = true;
-							for (let i = 0; i < d.length; i += 4) {
-								if (Math.abs(d[i] - d[i + 1]) > 8 || Math.abs(d[i + 1] - d[i + 2]) > 8) {
-									mono = false;
-									break;
-								}
-							}
-							if (mono) {
-								// Keep the existing grayscale-lava normalization. Water was
-								// handled above with its original alpha and animation contrast.
-								const fw = image.width;
-								const t = [255, 255, 255];
-								const TARGET_L = 0.72 * 255;
-								const GLOBAL_A = 255;
-								for (let fy = 0; fy + fw <= c.height; fy += fw) {
-									let lsum = 0,
-										asum = 0,
-										n = 0;
-									for (let y = fy; y < fy + fw; y++) {
-										for (let x = 0; x < fw; x++) {
-											const i = (y * c.width + x) * 4;
-											lsum += d[i];
-											asum += d[i + 3];
-											n++;
-										}
-									}
-									const lNorm = Math.min(2.5, TARGET_L / Math.max(1, lsum / n));
-									const frameA = Math.max(1, asum / n);
-									for (let y = fy; y < fy + fw; y++) {
-										for (let x = 0; x < fw; x++) {
-											const i = (y * c.width + x) * 4;
-											const m = Math.min(255, d[i] * lNorm);
-											d[i] = (m * t[0]) / 255;
-											d[i + 1] = (m * t[1]) / 255;
-											d[i + 2] = (m * t[2]) / 255;
-											// keep some texture life but equalize frames
-											d[i + 3] = Math.max(0, Math.min(255, GLOBAL_A + (d[i + 3] - frameA) * 0.5));
-										}
-									}
-								}
-								cx.putImageData(id, 0, 0);
-								// HARVEST the processed still frames into a DataArrayTexture
-								// (fable): one array LAYER per animation frame with hardware
-								// RepeatWrapping — the record shader samples water by world
-								// coordinates with zero risk of atlas bleed/gutter/neighbours.
-								if (path === "block/lava_still") {
-									const frames = Math.floor(c.height / fw);
-									if (frames > 1) {
-										const layer = new Uint8Array(fw * fw * 4 * frames);
-										for (let f = 0; f < frames; f++) {
-											const fd = cx.getImageData(0, f * fw, fw, fw).data;
-											layer.set(fd, f * fw * fw * 4);
-										}
-										const arrTex = new THREE.DataArrayTexture(layer, fw, fw, frames);
-										arrTex.format = THREE.RGBAFormat;
-										arrTex.type = THREE.UnsignedByteType;
-										arrTex.wrapS = THREE.RepeatWrapping;
-										arrTex.wrapT = THREE.RepeatWrapping;
-										arrTex.magFilter = THREE.LinearFilter;
-										// full mip chain down to the 1x1 frame mean: the shader picks the
-										// level explicitly (textureLod, isotropic), so distance converges
-										// to a uniform sheet instead of a mip patchwork
-										arrTex.minFilter = THREE.LinearMipmapLinearFilter;
-										// NO anisotropy: the shader samples with explicit LOD (implicit-
-										// derivative texture() inside the water branch is undefined because
-										// the branch is on a varying). Anisotropic filtering on explicit-LOD
-										// taps is implementation-defined and was the view-direction-dependent
-										// mip blend; 1 makes every driver behave identically.
-										arrTex.anisotropy = 1;
-										arrTex.generateMipmaps = true;
-										// NO colorspace mark: the shared atlas texture is unmarked too —
-										// marking only this one sRGB made three decode+tonemap it twice
-										// and the water rendered near-black
-										arrTex.needsUpdate = true;
-										try {
-											// late import avoids a cubane -> meshing cycle at module load
-											const reg = await import("../meshing/RecordRenderer");
-											reg.liquidFrameTextures.lava = arrTex;
-										} catch {
-											/* registry unavailable — atlas strip path still works */
-										}
-									}
-								}
-								const tinted = await createImageBitmap(c);
-								image.close?.();
-								return { path, image: tinted };
-							}
+							tintWaterPixels(id.data);
+							cx.putImageData(id, 0, 0);
+							const tinted = await createImageBitmap(c);
+							image.close?.();
+							return { path, image: tinted };
 						}
 						return { path, image };
 					} catch (e) {

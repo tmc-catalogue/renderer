@@ -8,7 +8,7 @@ import {
 	setFluidTextures,
 	updateFluidTime,
 } from "./WaterMesher";
-import { createWaterFrameTexture, tintWaterPixels } from "./WaterTextures";
+import { createFluidFrameTexture, tintWaterPixels } from "./WaterTextures";
 import { withoutFluidGeometry } from "./FluidGeometry";
 
 const meshes: THREE.Mesh[] = [];
@@ -138,7 +138,7 @@ describe("water textures", () => {
 	it("supports static packs and independent repeatable animation frames", () => {
 		for (const frames of [1, 3]) {
 			const pixels = new Uint8ClampedArray(2 * 2 * 4 * frames).fill(127);
-			const texture = createWaterFrameTexture(pixels, 2, 2 * frames);
+			const texture = createFluidFrameTexture(pixels, 2, 2 * frames);
 			expect(texture.image.depth).toBe(frames);
 			expect(texture.image.data).toEqual(new Uint8Array(pixels));
 			expect(texture.wrapS).toBe(THREE.RepeatWrapping);

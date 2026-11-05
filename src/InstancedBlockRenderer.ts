@@ -399,8 +399,8 @@ export class InstancedBlockRenderer {
 		switch (category) {
 			case "water":
 				mesh.renderOrder = 3;
-				material.transparent = true;
-				if ("opacity" in material) (material as any).opacity = 0.8;
+				// The shared liquid category includes lava. Preserve each fluid
+				// material's opacity and depth settings from AssetLoader.
 				break;
 			case "transparent":
 				mesh.renderOrder = 2;

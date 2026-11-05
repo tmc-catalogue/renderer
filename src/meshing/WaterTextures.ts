@@ -20,7 +20,7 @@ export function tintWaterPixels(pixels: Uint8ClampedArray): void {
 }
 
 /** One repeatable layer per square animation frame, including single-frame packs. */
-export function createWaterFrameTexture(
+export function createFluidFrameTexture(
 	pixels: Uint8ClampedArray,
 	width: number,
 	height: number
