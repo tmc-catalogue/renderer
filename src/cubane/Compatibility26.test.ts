@@ -224,6 +224,17 @@ describe("26.3 resource-pack compatibility", () => {
 	it.each([32, 128])(
 		"renders equal-sized front/back sign text in one canvas pass for %ipx packs",
 		async (signSize) => {
+			// The locked happy-dom version has no ImageData; our canvas mock only needs its pixels.
+			vi.stubGlobal(
+				"ImageData",
+				class {
+					constructor(
+						readonly data: Uint8ClampedArray,
+						readonly width: number,
+						readonly height: number
+					) {}
+				}
+			);
 			const canvases = new WeakMap<HTMLCanvasElement, ImageData>();
 			const context = vi
 				.spyOn(HTMLCanvasElement.prototype, "getContext")
@@ -300,6 +311,7 @@ describe("26.3 resource-pack compatibility", () => {
 				expect(context).toHaveBeenCalledTimes(4); // Wall variants reuse the same four baked textures.
 			} finally {
 				context.mockRestore();
+				vi.unstubAllGlobals();
 			}
 		}
 	);
