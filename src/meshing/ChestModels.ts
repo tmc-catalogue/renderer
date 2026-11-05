@@ -388,7 +388,8 @@ function forEachChestCell(
 	}
 	for (let i = 0; i < n; i++) {
 		const p = (positions as ArrayLike<unknown>)[i] as
-			ArrayLike<number> | { x: number; y: number; z: number };
+			| ArrayLike<number>
+			| { x: number; y: number; z: number };
 		if ("x" in (p as object)) {
 			const q = p as { x: number; y: number; z: number };
 			fn(q.x, q.y, q.z);
