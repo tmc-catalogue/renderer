@@ -32,6 +32,7 @@ export class TintManager {
 	// Minecraft grass/foliage colormaps (256×256), null until a pack supplies them.
 	private grassColormap: ImageData | null = null;
 	private foliageColormap: ImageData | null = null;
+	private dryFoliageColormap: ImageData | null = null;
 
 	// Register built-in tintable blocks
 	constructor() {
@@ -63,7 +64,9 @@ export class TintManager {
 		this.tintableBlocks.set("minecraft:tall_grass", "foliage");
 		this.tintableBlocks.set("minecraft:large_fern", "foliage");
 		this.tintableBlocks.set("minecraft:potted_fern", "foliage");
-		// ...more foliage blocks
+		this.tintableBlocks.set("minecraft:bush", "foliage");
+		this.tintableBlocks.set("minecraft:wildflowers", "foliage");
+		this.tintableBlocks.set("minecraft:leaf_litter", "dry_foliage");
 
 		// Water
 		this.tintableBlocks.set("minecraft:water", "water");
@@ -96,6 +99,8 @@ export class TintManager {
 				return this.getRedstoneTint(properties.power || "0");
 			case "foliage":
 				return this.getFoliageTint(blockId, biome);
+			case "dry_foliage":
+				return this.sampleColormap(this.dryFoliageColormap, biome, new THREE.Color(0xa0a55b));
 			case "water":
 				return this.getWaterTint(biome);
 			case "stem":
@@ -118,9 +123,14 @@ export class TintManager {
 	 * Supply the decoded grass/foliage colormaps (or null to clear). Called by the
 	 * AssetLoader once textures are available.
 	 */
-	public setColormaps(grass: ImageData | null, foliage: ImageData | null): void {
+	public setColormaps(
+		grass: ImageData | null,
+		foliage: ImageData | null,
+		dryFoliage: ImageData | null = null
+	): void {
 		this.grassColormap = grass;
 		this.foliageColormap = foliage;
+		this.dryFoliageColormap = dryFoliage;
 	}
 
 	/**

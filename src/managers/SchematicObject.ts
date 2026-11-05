@@ -1708,7 +1708,10 @@ export class SchematicObject extends EventEmitter {
 					return {};
 				}
 			};
-			const isChest2 = (b: string) => /^minecraft:(trapped_)?chest(\[|;|$)/.test(b);
+			const isChest2 = (b: string) =>
+				/^minecraft:(?:(?:trapped_|ender_)?chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest)(\[|;|$)/.test(
+					b
+				);
 			// CHESTS: per-cell template system (ChestModels.ts, approved design) —
 			// each cell renders its own (facing,type) half; no pairing/midpoint path
 			const chestSynth: Array<{
@@ -1747,6 +1750,37 @@ export class SchematicObject extends EventEmitter {
 					console.warn("[ChestModels] chest render failed:", e);
 				}
 			}
+			// These templates already carry block-local transforms. Preserve their poses
+			// and per-element materials instead of recentering or applying facing twice.
+			const special = new Map<string, typeof entityCells>();
+			for (let i = nonChestCells.length - 1; i >= 0; i--) {
+				const cell = nonChestCells[i];
+				if (!/copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom/.test(cell.block))
+					continue;
+				const cells = special.get(cell.block) ?? [];
+				cells.push(cell);
+				special.set(cell.block, cells);
+				nonChestCells.splice(i, 1);
+			}
+			for (const [state, cells] of special) {
+				const proto = await cubane.getBlockMesh(state, "plains", true);
+				proto.updateWorldMatrix(true, true);
+				proto.traverse((part: THREE.Object3D) => {
+					if (!(part instanceof THREE.Mesh)) return;
+					const materialList = Array.isArray(part.material) ? part.material : [part.material];
+					if (materialList.some((m: THREE.Material) => m.userData.isWater)) return;
+					const geometry = part.geometry.clone().applyMatrix4(part.matrixWorld);
+					const instances = new THREE.InstancedMesh(geometry, part.material, cells.length);
+					const matrix = new THREE.Matrix4();
+					cells.forEach((cell, i) =>
+						instances.setMatrixAt(i, matrix.makeTranslation(cell.x, cell.y, cell.z))
+					);
+					instances.instanceMatrix.needsUpdate = true;
+					instances.computeBoundingSphere();
+					meshes.push(instances);
+				});
+			}
+
 			const byPos = new Map<string, any>();
 			for (const c of nonChestCells) if (isChest2(c.block)) byPos.set(`${c.x},${c.y},${c.z}`, c);
 			const consumed2 = new Set<string>();
@@ -2275,7 +2309,7 @@ export class SchematicObject extends EventEmitter {
 		// water renderer on raw un-normalized strip textures made bypass patches
 		// adjacent to record patches visibly darker ("water changes color")
 		const ENTITY_FAMILY =
-			/minecraft:(trapped_chest|ender_chest|chest|redstone_wire|kelp|kelp_plant|seagrass|tall_seagrass)(\[|\s|$)/;
+			/minecraft:(trapped_chest|ender_chest|chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom|redstone_wire|kelp|kelp_plant|seagrass|tall_seagrass)(\[|\s|$)/;
 		const entityPalette = new Set<number>();
 		(palettes.default || []).forEach((e: any, i: number) => {
 			if (ENTITY_FAMILY.test(e?.name || e?.Name || "")) entityPalette.add(i);

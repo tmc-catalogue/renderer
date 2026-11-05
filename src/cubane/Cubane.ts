@@ -761,13 +761,26 @@ export class Cubane {
 			// Fall through to default handling if the sign couldn't be built.
 		}
 
-		if (/^minecraft:(chest|trapped_chest|ender_chest)$/.test(blockId)) {
+		if (
+			/^minecraft:(chest|trapped_chest|ender_chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest)$/.test(
+				blockId
+			)
+		) {
 			const { buildChestBlockMesh } = await import("../meshing/ChestModels");
 			const chest = await buildChestBlockMesh(blockString, this.assetLoader);
 			if (chest) {
 				if (useCache) this.blockMeshCache.set(cacheKey, chest.clone());
 				return chest;
 			}
+		}
+
+		if (
+			/^minecraft:(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_golem_statue$/.test(blockId)
+		) {
+			const { buildCopperGolemStatue } = await import("../meshing/CopperGolemModels");
+			const statue = await buildCopperGolemStatue(blockId, block.properties, this.assetLoader);
+			if (useCache) this.blockMeshCache.set(cacheKey, statue.clone());
+			return statue;
 		}
 
 		if (this.pureBlockEntityMap[blockId]) {

@@ -653,11 +653,12 @@ export class AssetLoader {
 		if (this.colormapsLoaded) return;
 		this.colormapsLoaded = true;
 
-		const [grass, foliage] = await Promise.all([
+		const [grass, foliage, dryFoliage] = await Promise.all([
 			this.loadColormapImageData("colormap/grass"),
 			this.loadColormapImageData("colormap/foliage"),
+			this.loadColormapImageData("colormap/dry_foliage"),
 		]);
-		this.tintManager.setColormaps(grass, foliage);
+		this.tintManager.setColormaps(grass, foliage, dryFoliage);
 	}
 
 	private async loadColormapImageData(texturePath: string): Promise<ImageData | null> {
@@ -834,6 +835,7 @@ export class AssetLoader {
 		texturePath: string,
 		options: {
 			transparent?: boolean;
+			lightEmission?: number;
 			tint?: THREE.Color;
 			isLiquid?: boolean;
 			isWater?: boolean;
@@ -853,6 +855,7 @@ export class AssetLoader {
 		const cacheKey = `material:${texturePath}:${useAtlas ? "atlas" : "individual"}:${JSON.stringify(
 			{
 				transparent: options.transparent,
+				lightEmission: options.lightEmission,
 				isLiquid: options.isLiquid,
 				isWater: options.isWater,
 				isLava: options.isLava,
@@ -1000,6 +1003,11 @@ export class AssetLoader {
 			}
 		}
 
+		if (options.lightEmission) {
+			materialOptions.emissiveMap = texture;
+			materialOptions.emissive = new THREE.Color(0xffffff);
+			materialOptions.emissiveIntensity = Math.min(15, Math.max(0, options.lightEmission)) / 15;
+		}
 		const material = new THREE.MeshStandardMaterial(materialOptions);
 
 		// Store atlas UV data in userData

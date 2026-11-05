@@ -1,5 +1,7 @@
 import * as THREE from "three";
 import { AssetLoader } from "./AssetLoader";
+import { ModelResolver } from "./ModelResolver";
+import { BlockMeshBuilder } from "./BlockMeshBuilder";
 
 /**
  * Vanilla-accurate sign rendering for cubane.
@@ -35,6 +37,7 @@ const SIGN_WOODS = [
 	"cherry",
 	"bamboo",
 	"pale_oak",
+	"poplar",
 ];
 
 interface SignInfo {
@@ -116,6 +119,10 @@ export class SignRenderer {
 		const info = this.detectSign(blockName, properties);
 		if (!info) return null;
 
+		// Modern packs provide block models and block textures, including attached chains.
+		if (!(await this.getBasePixels(info.texturePath))) {
+			return this.buildModernSign(blockName, properties, nbtData ?? {}, info);
+		}
 		const parts = this.buildParts(info);
 		const geometry = this.buildGeometry(parts, info.facingAngle);
 
@@ -138,6 +145,78 @@ export class SignRenderer {
 		// coordinate, so no positional offset is needed.
 		const group = new THREE.Group();
 		group.add(mesh);
+		return group;
+	}
+
+	private async buildModernSign(
+		blockName: string,
+		properties: Record<string, string>,
+		nbt: Record<string, any>,
+		info: SignInfo
+	): Promise<THREE.Object3D | null> {
+		const texturePath = `block/${info.wood}_${info.isHanging ? "hanging_sign" : "sign"}`;
+		const base = await this.getBasePixels(texturePath);
+		if (!base) return null;
+		const front = this.extractSignText(nbt);
+		const back = this.extractSignText({ front_text: nbt.back_text ?? nbt.Text?.back_text });
+		const key = JSON.stringify([texturePath, front, back]);
+		let texture = this.textureCache.get(key);
+		if (!texture) {
+			// Regions are expressed in the legacy compositor's 64px coordinate space.
+			const frontRegion: [number, number, number, number] = info.isHanging
+				? [4, 32, 28, 20]
+				: [0, 4, 48, 24];
+			const backRegion: [number, number, number, number] = info.isHanging
+				? [36, 32, 28, 20]
+				: [0, 32, 48, 24];
+			const frontCanvas = await this.compositeSignWithText(
+				base,
+				info,
+				front.lines,
+				front.color,
+				front.glowing,
+				[frontRegion]
+			);
+			const ctx = frontCanvas.getContext("2d") as CanvasRenderingContext2D;
+			const pixels = ctx.getImageData(0, 0, frontCanvas.width, frontCanvas.height);
+			const canvas = await this.compositeSignWithText(
+				pixels,
+				info,
+				back.lines,
+				back.color,
+				back.glowing,
+				[backRegion],
+				1
+			);
+			texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
+			texture.magFilter = THREE.NearestFilter;
+			texture.minFilter = THREE.NearestFilter;
+			texture.generateMipmaps = false;
+			texture.colorSpace = THREE.NoColorSpace;
+			this.textureCache.set(key, texture);
+		}
+		const block = { namespace: "minecraft", name: blockName.replace("minecraft:", ""), properties };
+		const resolver = new ModelResolver(this.assetLoader);
+		const builder = new BlockMeshBuilder(this.assetLoader, { useAtlas: false });
+		const group = new THREE.Group();
+		for (const variant of await resolver.resolveBlockModel(block)) {
+			const model = await this.assetLoader.getModel(variant.model);
+			const part = await builder.createBlockMeshNoWater(model, variant, block);
+			part.traverse((object) => {
+				if (!(object instanceof THREE.Mesh)) return;
+				const material = object.material as THREE.MeshStandardMaterial;
+				if (material.userData.texturePath?.replace("minecraft:", "") === texturePath) {
+					material.map = texture;
+					material.needsUpdate = true;
+				}
+			});
+			part.rotation.set(
+				(-(variant.x ?? 0) * Math.PI) / 180,
+				(-(variant.y ?? 0) * Math.PI) / 180,
+				0
+			);
+			group.add(part);
+		}
 		return group;
 	}
 
@@ -585,10 +664,11 @@ export class SignRenderer {
 		info: SignInfo,
 		lines: string[],
 		color: string,
-		glowing: boolean
+		glowing: boolean,
+		customRegions?: [number, number, number, number][],
+		scale = 4
 	): Promise<HTMLCanvasElement | OffscreenCanvas> {
 		await this.ensureFont();
-		const scale = 4;
 		const outW = base.width * scale;
 		const outH = base.height * scale;
 		const out = new Uint8ClampedArray(outW * outH * 4);
@@ -610,17 +690,19 @@ export class SignRenderer {
 		const font = this.fontData;
 		if (font) {
 			// Text regions (x,y,w,h) in base-texture pixels — board front (± back).
-			const regions: [number, number, number, number][] = info.isHanging
-				? [
-						[2, 14, 14, 10],
-						[18, 14, 14, 10],
-					]
-				: info.isWall
+			const regions: [number, number, number, number][] =
+				customRegions ??
+				(info.isHanging
 					? [
-							[2, 2, 24, 12],
-							[28, 2, 24, 12],
+							[2, 14, 14, 10],
+							[18, 14, 14, 10],
 						]
-					: [[2, 2, 24, 12]];
+					: info.isWall
+						? [
+								[2, 2, 24, 12],
+								[28, 2, 24, 12],
+							]
+						: [[2, 2, 24, 12]]);
 
 			const nonEmpty = Math.max(
 				1,

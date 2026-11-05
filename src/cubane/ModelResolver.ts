@@ -1,5 +1,5 @@
 import { AssetLoader } from "./AssetLoader";
-import { ModelData, Block, BlockStateDefinitionVariant } from "./types";
+import { ModelData, Block, MultipartCondition } from "./types";
 
 export class ModelResolver {
 	private assetLoader: AssetLoader;
@@ -160,24 +160,7 @@ export class ModelResolver {
 		// Handle multipart models
 		if (blockStateDefinition.multipart) {
 			for (const part of blockStateDefinition.multipart) {
-				let applies = true;
-
-				// Check conditions
-				if (part.when) {
-					if ("OR" in part.when) {
-						// OR condition - any of the conditions can match
-						applies = false;
-						for (const condition of part.when.OR as BlockStateDefinitionVariant<string>[]) {
-							if (this.matchesCondition(block, condition as Record<string, string>)) {
-								applies = true;
-								break;
-							}
-						}
-					} else {
-						// AND condition - all conditions must match
-						applies = this.matchesCondition(block, part.when);
-					}
-				}
+				const applies = !part.when || this.matchesCondition(block, part.when);
 
 				// If conditions are met, add the model(s)
 				if (applies) {
@@ -232,8 +215,14 @@ export class ModelResolver {
 		};
 	}
 
-	private matchesCondition(block: Block, condition: Record<string, string | number>): boolean {
+	private matchesCondition(block: Block, condition: MultipartCondition): boolean {
 		for (const [property, value] of Object.entries(condition)) {
+			if (property === "AND" || property === "OR") {
+				if (!Array.isArray(value)) return false;
+				const matches = (child: MultipartCondition) => this.matchesCondition(block, child);
+				if (!(property === "AND" ? value.every(matches) : value.some(matches))) return false;
+				continue;
+			}
 			const blockValue = block.properties[property];
 
 			// If property not found, condition fails
@@ -243,18 +232,9 @@ export class ModelResolver {
 
 			// Convert both values to strings for comparison
 			const valueStr = String(value);
-			const blockValueStr = String(blockValue);
-
-			// Check for OR value (pipe separated)
-			if (valueStr.includes("|")) {
-				const values = valueStr.split("|");
-				if (!values.includes(blockValueStr)) {
-					return false;
-				}
-			} else if (blockValueStr !== valueStr) {
-				// Simple equality check
-				return false;
-			}
+			const negated = valueStr.startsWith("!");
+			const allowed = (negated ? valueStr.slice(1) : valueStr).split("|");
+			if (allowed.includes(String(blockValue)) === negated) return false;
 		}
 
 		return true;
