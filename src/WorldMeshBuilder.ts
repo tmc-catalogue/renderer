@@ -549,17 +549,6 @@ export class WorldMeshBuilder {
 			try {
 				// Get geometry from Cubane (Main Thread)
 				const cubaneObj = await this.cubane.getBlockMesh(blockString, biome, true);
-				if (cubaneObj) {
-					let anyTrans = false;
-					cubaneObj.traverse((o: any) => {
-						if (anyTrans || !o.isMesh) return;
-						const mats = Array.isArray(o.material) ? o.material : [o.material];
-						if (mats.some((mm: any) => mm && (mm.transparent || (mm.alphaTest ?? 0) > 0)))
-							anyTrans = true;
-					});
-					if (anyTrans)
-						this.modelTransparentNames.add(blockState?.name || blockString.split("[")[0]);
-				}
 				const extractedGeometries = cubaneObj
 					? this.extractAllMeshData(cubaneObj)
 					: this.extractAllMeshData(this.createFallbackObject3D(blockString));
@@ -568,6 +557,7 @@ export class WorldMeshBuilder {
 				const materialGroups: PaletteMaterialGroup[] = [];
 				const geometryData: any[] = [];
 				let removedFluid = false;
+				let hasTransparentGeometry = false;
 
 				for (const { geometry, material } of extractedGeometries) {
 					if (geometry.attributes.position.count === 0) continue;
@@ -582,6 +572,12 @@ export class WorldMeshBuilder {
 						geometry.dispose();
 						continue;
 					}
+
+					// Classify only geometry sent to the mesher. Removed fluid must not
+					// move an opaque host out of the solid pass, while cutouts still need
+					// the transparent pass. Keep this local to each palette entry so
+					// block states and resource-pack rebuilds cannot affect one another.
+					hasTransparentGeometry ||= material.transparent || material.alphaTest > 0;
 
 					// Get or create shared material
 					const sharedMaterial = MaterialRegistry.getMaterial(material);
@@ -654,7 +650,8 @@ export class WorldMeshBuilder {
 				const category = this.getBlockCategory(
 					blockState.name,
 					blockState.properties,
-					!fluidSurface
+					!fluidSurface,
+					hasTransparentGeometry
 				);
 
 				paletteBlockData[index] = {
@@ -1501,7 +1498,8 @@ export class WorldMeshBuilder {
 			if (blockEntityMap.size > 0 && blockEntityMap.size < 10000) {
 				// Use spatial cache if available, otherwise build it once
 				let spatialCache = (schematicObject as any)._entitySpatialCache as
-					Map<string, any[]> | undefined;
+					| Map<string, any[]>
+					| undefined;
 
 				if (!spatialCache) {
 					spatialCache = new Map<string, any[]>();
@@ -1869,17 +1867,11 @@ export class WorldMeshBuilder {
 		"minecraft:bubble_column",
 	]);
 
-	// Block names whose CUBANE MODEL carries any transparent/alphaTest material —
-	// the record path's solid pass is discard-free (early-Z), so cutout blocks
-	// (flowers, saplings, bars, torches...) must route to the transparent pass.
-	// Populated during precomputePaletteGeometries from the actual model data;
-	// the old hardcoded glass/leaves/ice list missed every other cutout block.
-	private modelTransparentNames = new Set<string>();
-
 	private getBlockCategory(
 		blockName: string,
 		properties?: Record<string, string>,
-		includesFluid = true
+		includesFluid = true,
+		hasTransparentGeometry = false
 	): keyof ChunkMeshes {
 		if (blockName.includes("water") || blockName.includes("lava")) return "water";
 		// Only legacy templates still include the surrounding water cube. Once the
@@ -1891,7 +1883,7 @@ export class WorldMeshBuilder {
 		) {
 			return "water";
 		}
-		if (this.modelTransparentNames.has(blockName)) return "transparent";
+		if (hasTransparentGeometry) return "transparent";
 		if (
 			blockName.includes("glass") ||
 			blockName.includes("leaves") ||
