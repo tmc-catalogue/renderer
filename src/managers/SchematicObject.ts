@@ -36,6 +36,7 @@ import {
 } from "../meshing/SurfaceIndex";
 import { buildEndPortalMesh, makeEndPortalMaterial } from "../meshing/EndPortal";
 import { fluidPaletteStates } from "../meshing/FluidStateLookup";
+import { bakeStaticModelParts } from "../meshing/StaticModelParts";
 
 // Define chunk data interface to fix TypeScript errors
 
@@ -1720,7 +1721,14 @@ export class SchematicObject extends EventEmitter {
 				positions: Array<{ x: number; y: number; z: number }>;
 			}> = [];
 			const nonChestCells: typeof entityCells = [];
+			const special = new Map<string, typeof entityCells>();
 			for (const c of entityCells) {
+				if (/copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom/.test(c.block)) {
+					const cells = special.get(c.block);
+					if (cells) cells.push(c);
+					else special.set(c.block, [c]);
+					continue;
+				}
 				if (!isChest2(c.block)) {
 					nonChestCells.push(c);
 					continue;
@@ -1752,25 +1760,16 @@ export class SchematicObject extends EventEmitter {
 			}
 			// These templates already carry block-local transforms. Preserve their poses
 			// and per-element materials instead of recentering or applying facing twice.
-			const special = new Map<string, typeof entityCells>();
-			for (let i = nonChestCells.length - 1; i >= 0; i--) {
-				const cell = nonChestCells[i];
-				if (!/copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom/.test(cell.block))
-					continue;
-				const cells = special.get(cell.block) ?? [];
-				cells.push(cell);
-				special.set(cell.block, cells);
-				nonChestCells.splice(i, 1);
-			}
 			for (const [state, cells] of special) {
 				const proto = await cubane.getBlockMesh(state, "plains", true);
-				proto.updateWorldMatrix(true, true);
-				proto.traverse((part: THREE.Object3D) => {
-					if (!(part instanceof THREE.Mesh)) return;
+				for (const part of bakeStaticModelParts(proto)) {
 					const materialList = Array.isArray(part.material) ? part.material : [part.material];
-					if (materialList.some((m: THREE.Material) => m.userData.isWater)) return;
-					const geometry = part.geometry.clone().applyMatrix4(part.matrixWorld);
-					const instances = new THREE.InstancedMesh(geometry, part.material, cells.length);
+					if (materialList.some((m: THREE.Material) => m.userData.isWater)) {
+						part.geometry.dispose();
+						continue;
+					}
+					part.geometry.applyMatrix4(proto.matrix);
+					const instances = new THREE.InstancedMesh(part.geometry, part.material, cells.length);
 					const matrix = new THREE.Matrix4();
 					cells.forEach((cell, i) =>
 						instances.setMatrixAt(i, matrix.makeTranslation(cell.x, cell.y, cell.z))
@@ -1778,7 +1777,7 @@ export class SchematicObject extends EventEmitter {
 					instances.instanceMatrix.needsUpdate = true;
 					instances.computeBoundingSphere();
 					meshes.push(instances);
-				});
+				}
 			}
 
 			const byPos = new Map<string, any>();
