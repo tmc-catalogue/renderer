@@ -2,7 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import JSZip from "jszip";
 import { buildFluidMeshes, setFluidTextures } from "../../../src/meshing/WaterMesher";
-import { createWaterFrameTexture, tintWaterPixels } from "../../../src/meshing/WaterTextures";
+import { createFluidFrameTexture, tintWaterPixels } from "../../../src/meshing/WaterTextures";
+import type { FluidAnimationMetadata } from "../../../src/meshing/FluidAnimation";
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -36,7 +37,11 @@ async function texture(name: string) {
 	const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 	tintWaterPixels(pixels);
 	image.close();
-	return createWaterFrameTexture(pixels, canvas.width, canvas.height);
+	const sidecar = pack.file(`assets/minecraft/textures/block/${name}.png.mcmeta`);
+	const metadata: FluidAnimationMetadata | undefined = sidecar
+		? JSON.parse(await sidecar.async("string"))
+		: undefined;
+	return createFluidFrameTexture(pixels, canvas.width, canvas.height, metadata);
 }
 setFluidTextures({ water: await texture("water_still"), waterFlow: await texture("water_flow") });
 const sx = 10,

@@ -71,4 +71,16 @@ describe("resource-pack fluid animations", () => {
 		expect(fluidAnimationFrame(tex, 123).toArray()).toEqual([0, 0, 0]);
 		tex.dispose();
 	});
+
+	it.each([
+		[{ width: 16 }, [16, 64, 1]],
+		[{ height: 16 }, [16, 16, 4]],
+		[{}, [16, 16, 4]],
+	] as const)("preserves vanilla frame-size defaults for %j", (animation, dimensions) => {
+		const texture = createFluidFrameTexture(new Uint8ClampedArray(16 * 64 * 4), 16, 64, {
+			animation,
+		});
+		expect([texture.image.width, texture.image.height, texture.image.depth]).toEqual(dimensions);
+		texture.dispose();
+	});
 });
