@@ -64,6 +64,7 @@ export class AssetLoader {
 	 */
 	public setPackManager(manager: ResourcePackManager): void {
 		this.invalidateFluidFrames();
+		this.invalidateColormaps();
 		this.stringCache.clear();
 		this.packManager = manager;
 		this.usePackManager = true;
@@ -93,7 +94,7 @@ export class AssetLoader {
 		this.materialCache.clear();
 
 		// Force colormaps to reload from the newly-enabled packs.
-		this.colormapsLoaded = false;
+		this.invalidateColormaps();
 
 		if (this.textureAtlas) {
 			this.textureAtlas.dispose();
@@ -204,6 +205,7 @@ export class AssetLoader {
 			this.resourcePackOrder.unshift(packId);
 			this.stringCache.clear();
 			this.invalidateFluidFrames();
+			this.invalidateColormaps();
 		} catch (error) {
 			console.error("❌ Failed to load resource pack:", error);
 			throw error;
@@ -660,7 +662,13 @@ export class AssetLoader {
 		return this.animatedTextureManager.hasActiveTextures();
 	}
 
-	private colormapsLoaded = false;
+	private colormapLoad: Promise<void> | null = null;
+	private colormapGeneration = 0;
+
+	private invalidateColormaps(): void {
+		this.colormapGeneration++;
+		this.colormapLoad = null;
+	}
 
 	/**
 	 * Load Minecraft's grass/foliage colormaps from the active resource pack and
@@ -668,16 +676,24 @@ export class AssetLoader {
 	 * If the pack ships no colormaps the TintManager falls back to sane defaults.
 	 * Guarded so it only decodes once per atlas (re)build.
 	 */
-	public async loadColormaps(): Promise<void> {
-		if (this.colormapsLoaded) return;
-		this.colormapsLoaded = true;
-
-		const [grass, foliage, dryFoliage] = await Promise.all([
+	public loadColormaps(): Promise<void> {
+		if (this.colormapLoad) return this.colormapLoad;
+		const generation = this.colormapGeneration;
+		const load = Promise.all([
 			this.loadColormapImageData("colormap/grass"),
 			this.loadColormapImageData("colormap/foliage"),
 			this.loadColormapImageData("colormap/dry_foliage"),
-		]);
-		this.tintManager.setColormaps(grass, foliage, dryFoliage);
+		])
+			.then(([grass, foliage, dryFoliage]) => {
+				if (generation === this.colormapGeneration)
+					this.tintManager.setColormaps(grass, foliage, dryFoliage);
+			})
+			.catch((error) => {
+				if (this.colormapLoad === load) this.colormapLoad = null;
+				throw error;
+			});
+		this.colormapLoad = load;
+		return load;
 	}
 
 	private async loadColormapImageData(texturePath: string): Promise<ImageData | null> {
@@ -1562,6 +1578,7 @@ export class AssetLoader {
 	 */
 	public async rebuildTextureAtlas(): Promise<THREE.Texture> {
 		this.invalidateFluidFrames();
+		this.invalidateColormaps();
 		// Clear current atlas
 		this.textureAtlas = null;
 		this.textureUVMap.clear();
@@ -1697,6 +1714,8 @@ export class AssetLoader {
 	 */
 	public dispose(): void {
 		this.invalidateFluidFrames();
+		this.invalidateColormaps();
+		this.tintManager.setColormaps(null, null, null);
 		// Dispose of all textures
 		this.textureCache.forEach((texture) => texture.dispose());
 		this.textureCache.clear();
