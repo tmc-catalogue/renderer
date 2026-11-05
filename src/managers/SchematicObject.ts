@@ -77,11 +77,11 @@ export class SchematicObject extends EventEmitter {
 			if (!mesh.visible || mesh.parent !== this.group) continue;
 			const material = mesh.material as THREE.ShaderMaterial;
 			if (material.opacity <= 0) continue;
-			const clip = material.uniforms.uLayerClip.value as THREE.Vector2;
-			if (clip.x > 0.5 && mesh.userData.minCellY > clip.y) continue;
+			const clip = material.uniforms.uLayerClip?.value as THREE.Vector2 | undefined;
+			if (clip && clip.x > 0.5 && mesh.userData.minCellY > clip.y) continue;
 			mesh.updateWorldMatrix(false, false);
 			this.surfaceViewBox.copy(mesh.geometry.boundingBox!);
-			if (clip.x > 0.5)
+			if (clip && clip.x > 0.5)
 				this.surfaceViewBox.max.y = Math.min(this.surfaceViewBox.max.y, Math.floor(clip.y) + 0.25);
 			this.surfaceViewBox.applyMatrix4(mesh.matrixWorld);
 			if (frustum.intersectsBox(this.surfaceViewBox)) return true;
@@ -2562,7 +2562,8 @@ export class SchematicObject extends EventEmitter {
 
 		// Initialize instanced rendering
 		await this.worldMeshBuilder.precomputePaletteGeometries(
-			this.getPalettes(this.schematicWrapper).default
+			this.getPalettes(this.schematicWrapper).default,
+			true
 		);
 
 		this.worldMeshBuilder.enableInstancedRendering(this.group, true);
@@ -2574,6 +2575,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Return instanced meshes from scene graph
 		const instancedMeshes = Array.from(this.group.children);
+		instancedMeshes.push(...(await this.buildFluidSurface(schematicObject)));
 
 		// Dispatch completion event
 		if (typeof window !== "undefined") {

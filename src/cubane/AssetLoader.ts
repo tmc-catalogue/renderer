@@ -1198,6 +1198,8 @@ export class AssetLoader {
 			["water", "water_still"],
 			["waterFlow", "water_flow"],
 			["lava", "lava_still"],
+			["lavaFlow", "lava_flow"],
+			["waterOverlay", "water_overlay"],
 		] as const) {
 			const blob = await this.getResourceBlob(`textures/block/${path}.png`);
 			let frames: THREE.DataArrayTexture | null = null;
@@ -1211,8 +1213,16 @@ export class AssetLoader {
 					if (context) {
 						context.drawImage(image, 0, 0);
 						const pixels = context.getImageData(0, 0, image.width, image.height).data;
-						if (key !== "lava") tintWaterPixels(pixels);
-						frames = createFluidFrameTexture(pixels, image.width, image.height);
+						if (key.startsWith("water")) tintWaterPixels(pixels);
+						const metadata = await this.animatedTextureManager.loadAnimationMetadata(
+							`block/${path}`
+						);
+						frames = createFluidFrameTexture(
+							pixels,
+							image.width,
+							image.height,
+							metadata ?? undefined
+						);
 					}
 				} finally {
 					image.close?.();

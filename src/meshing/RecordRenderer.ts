@@ -441,10 +441,14 @@ export const liquidFrameTextures: {
 	water: THREE.DataArrayTexture | null;
 	waterFlow: THREE.DataArrayTexture | null;
 	lava: THREE.DataArrayTexture | null;
+	lavaFlow: THREE.DataArrayTexture | null;
+	waterOverlay: THREE.DataArrayTexture | null;
 } = {
 	water: null,
 	waterFlow: null,
 	lava: null,
+	lavaFlow: null,
+	waterOverlay: null,
 };
 
 export function makePullMaterial(transparent: boolean, quad = false): THREE.ShaderMaterial {

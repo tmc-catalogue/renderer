@@ -236,6 +236,61 @@ for (const [i, state] of partial.entries()) {
 		"Solid controls last",
 	]);
 }
+// Liquid appearance: still pools, all flowing levels, falling columns, and glass boundaries.
+for (const [index, fluid] of ["water", "lava"].entries()) {
+	const x = index * 52,
+		z = 144;
+	pad(x, z, 45, 24);
+	for (let dx = 1; dx <= 14; dx++)
+		for (let dz = 1; dz <= 10; dz++) {
+			put(x + dx, 0, z + dz, (dx + dz) % 2 ? "white_concrete" : "black_concrete");
+			if (dx === 1 || dx === 14 || dz === 1 || dz === 10) put(x + dx, 1, z + dz, "stone");
+			else put(x + dx, 1, z + dz, `${fluid}[level=0]`, true);
+		}
+	sign(x + 7, 1, z + 12, [
+		fluid.toUpperCase(),
+		"STILL POOL",
+		"Native color / alpha",
+		"Frame timing",
+	]);
+	for (let level = 0; level < 8; level++)
+		for (let dz = 0; dz < 4; dz++)
+			put(x + 20 + level, 1, z + 2 + dz, `${fluid}[level=${level}]`, true);
+	sign(x + 24, 1, z + 8, [
+		fluid.toUpperCase(),
+		"LEVELS 0 - 7",
+		"Flow direction",
+		"16 pixels per block",
+	]);
+	for (let dx = 0; dx < 8; dx++) {
+		put(x + 20 + dx, 3, z + 16, "stone");
+		put(x + 20 + dx, 4, z + 16, `${fluid}[level=${Math.min(dx, 7)}]`, true);
+	}
+	for (let y = 1; y <= 4; y++) put(x + 28, y, z + 16, `${fluid}[level=8]`, true);
+	for (let dx = 27; dx <= 31; dx++)
+		for (let dz = 15; dz <= 19; dz++)
+			if (dx !== 28 || dz !== 16) put(x + dx, 1, z + dz, `${fluid}[level=0]`, true);
+	sign(x + 24, 1, z + 21, [
+		fluid.toUpperCase(),
+		"FALL / SPILL",
+		"Flowing side texture",
+		"Frame order",
+	]);
+	for (const [i, boundary] of [
+		"glass",
+		"oak_leaves[persistent=true,distance=1]",
+		"ice",
+	].entries()) {
+		put(x + 2 + i * 5, 1, z + 17, `${fluid}[level=0]`, true);
+		put(x + 3 + i * 5, 1, z + 17, boundary, true);
+	}
+	sign(x + 7, 1, z + 20, [
+		fluid.toUpperCase(),
+		"GLASS / LEAVES / ICE",
+		"Water overlay",
+		"Side visibility",
+	]);
+}
 const bytes = s.to_litematic();
 const out = new URL("../test/public/schematics/26.3-compatibility.litematic", import.meta.url);
 fs.writeFileSync(out, bytes);

@@ -8,7 +8,7 @@ import { createFluidMaterial, setFluidTextures, updateFluidTime } from "../meshi
 afterEach(() => {
 	vi.restoreAllMocks();
 	vi.unstubAllGlobals();
-	for (const key of ["water", "waterFlow", "lava"] as const) {
+	for (const key of ["water", "waterFlow", "waterOverlay", "lava", "lavaFlow"] as const) {
 		liquidFrameTextures[key]?.dispose();
 		liquidFrameTextures[key] = null;
 	}
@@ -30,6 +30,7 @@ describe("lava rendering", () => {
 			vi.spyOn(loader, "getResourceBlob").mockImplementation(async (path) =>
 				path === "textures/block/lava_still.png" ? new Blob(["lava"]) : undefined
 			);
+			vi.spyOn(loader, "getResourceString").mockResolvedValue('{"animation":{"frametime":2}}');
 			const close = vi.fn();
 			vi.stubGlobal(
 				"createImageBitmap",
@@ -48,8 +49,8 @@ describe("lava rendering", () => {
 			const material = createFluidMaterial("lava");
 			expect(material.uniforms.uHasTex.value).toBe(1);
 			expect(material.uniforms.uTex.value).toBe(texture);
-			updateFluidTime(0.375);
-			expect(material.uniforms.uFrame0.value).toBe(frames === 1 ? 0 : 1);
+			updateFluidTime(0.125);
+			expect(material.uniforms.uStillFrame.value.x).toBe(frames === 1 ? 0 : 1);
 			expect(material.transparent).toBe(false);
 			expect(material.depthWrite).toBe(true);
 			await loader.buildTextureAtlas();
