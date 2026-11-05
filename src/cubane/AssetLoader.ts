@@ -6,6 +6,15 @@ import { BlockModel, BlockStateDefinition } from "./types";
 import { AtlasBuilder } from "./AtlasBuilder";
 import { ResourcePackManager } from "./ResourcePackManager";
 import { createFluidFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
+import type { FluidTextures } from "../meshing/WaterMesher";
+
+const FLUID_TEXTURES = [
+	["water", "water_still"],
+	["waterFlow", "water_flow"],
+	["lava", "lava_still"],
+	["lavaFlow", "lava_flow"],
+	["waterOverlay", "water_overlay"],
+] as const;
 
 export class AssetLoader {
 	private resourcePacks: Map<string, JSZip> = new Map();
@@ -23,6 +32,11 @@ export class AssetLoader {
 	private modelCache: Map<string, BlockModel> = new Map();
 	private textureCache: Map<string, THREE.Texture> = new Map();
 	private materialCache: Map<string, THREE.Material> = new Map();
+	private fluidFramesLoad: {
+		promise: Promise<void>;
+		textures: FluidTextures;
+		registry?: FluidTextures;
+	} | null = null;
 
 	// Texture loader
 	private textureLoader = new THREE.TextureLoader();
@@ -63,6 +77,7 @@ export class AssetLoader {
 	 */
 	private async rebuildFromPackManager(): Promise<void> {
 		if (!this.packManager) return;
+		this.invalidateFluidFrames();
 
 		// Clear caches that depend on pack content
 		this.stringCache.clear();
@@ -185,6 +200,7 @@ export class AssetLoader {
 			const packId = `pack_${Date.now()}`;
 			this.resourcePacks.set(packId, zip);
 			this.resourcePackOrder.unshift(packId);
+			this.invalidateFluidFrames();
 		} catch (error) {
 			console.error("❌ Failed to load resource pack:", error);
 			throw error;
@@ -1191,46 +1207,80 @@ export class AssetLoader {
 		tex.anisotropy = 8; // clamped to the renderer's max at upload; kills grazing-angle arcs
 	}
 
-	/** Fluid arrays are separate from the atlas and must also load on an atlas cache hit. */
-	private async loadFluidFrames(): Promise<void> {
-		const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
-		for (const [key, path] of [
-			["water", "water_still"],
-			["waterFlow", "water_flow"],
-			["lava", "lava_still"],
-			["lavaFlow", "lava_flow"],
-			["waterOverlay", "water_overlay"],
-		] as const) {
-			const blob = await this.getResourceBlob(`textures/block/${path}.png`);
-			let frames: THREE.DataArrayTexture | null = null;
-			if (blob) {
-				const image = await createImageBitmap(blob);
-				try {
-					const canvas = document.createElement("canvas");
-					canvas.width = image.width;
-					canvas.height = image.height;
-					const context = canvas.getContext("2d", { willReadFrequently: true });
-					if (context) {
-						context.drawImage(image, 0, 0);
-						const pixels = context.getImageData(0, 0, image.width, image.height).data;
-						if (key.startsWith("water")) tintWaterPixels(pixels);
-						const metadata = await this.animatedTextureManager.loadAnimationMetadata(
-							`block/${path}`
-						);
-						frames = createFluidFrameTexture(
-							pixels,
-							image.width,
-							image.height,
-							metadata ?? undefined
-						);
-					}
-				} finally {
-					image.close?.();
-				}
-			}
-			liquidFrameTextures[key]?.dispose();
-			liquidFrameTextures[key] = frames;
+	private invalidateFluidFrames(): void {
+		const load = this.fluidFramesLoad;
+		this.fluidFramesLoad = null;
+		if (load) this.releaseFluidFrames(load);
+	}
+
+	private releaseFluidFrames(load: NonNullable<AssetLoader["fluidFramesLoad"]>): void {
+		for (const [key] of FLUID_TEXTURES) {
+			const texture = load.textures[key];
+			if (!texture) continue;
+			if (load.registry?.[key] === texture) load.registry[key] = null;
+			texture.dispose();
 		}
+		load.textures = {};
+	}
+
+	/** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
+	private loadFluidFrames(): Promise<void> {
+		if (this.fluidFramesLoad) return this.fluidFramesLoad.promise;
+		const load: NonNullable<AssetLoader["fluidFramesLoad"]> = {
+			promise: Promise.resolve(),
+			textures: {},
+		};
+		this.fluidFramesLoad = load;
+		load.promise = (async () => {
+			const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
+			load.registry = liquidFrameTextures;
+			const entries = await Promise.all(
+				FLUID_TEXTURES.map(async ([key, path]) => {
+					let image: ImageBitmap | undefined;
+					let frames: THREE.DataArrayTexture | null = null;
+					try {
+						const blob = await this.getResourceBlob(`textures/block/${path}.png`);
+						if (!blob) return [key, null] as const;
+						image = await createImageBitmap(blob);
+						const canvas = document.createElement("canvas");
+						canvas.width = image.width;
+						canvas.height = image.height;
+						const context = canvas.getContext("2d", { willReadFrequently: true });
+						if (context) {
+							context.drawImage(image, 0, 0);
+							const pixels = context.getImageData(0, 0, image.width, image.height).data;
+							if (key.startsWith("water")) tintWaterPixels(pixels);
+							const metadata = await this.animatedTextureManager.loadAnimationMetadata(
+								`block/${path}`
+							);
+							frames = createFluidFrameTexture(
+								pixels,
+								image.width,
+								image.height,
+								metadata ?? undefined
+							);
+						}
+					} catch (error) {
+						console.warn(`Failed to load fluid texture block/${path}; using fallback:`, error);
+					} finally {
+						image?.close();
+					}
+					return [key, frames] as const;
+				})
+			);
+			load.textures = Object.fromEntries(entries);
+			// A pack switch or disposal can finish while the PNGs are decoding.
+			if (this.fluidFramesLoad !== load) {
+				this.releaseFluidFrames(load);
+				return;
+			}
+			Object.assign(liquidFrameTextures, load.textures);
+		})().catch((error) => {
+			if (this.fluidFramesLoad === load) this.fluidFramesLoad = null;
+			this.releaseFluidFrames(load);
+			throw error;
+		});
+		return load.promise;
 	}
 
 	public async buildTextureAtlas(): Promise<THREE.Texture> {
@@ -1501,6 +1551,7 @@ export class AssetLoader {
 	 * Force rebuild atlas (ignores cache)
 	 */
 	public async rebuildTextureAtlas(): Promise<THREE.Texture> {
+		this.invalidateFluidFrames();
 		// Clear current atlas
 		this.textureAtlas = null;
 		this.textureUVMap.clear();
@@ -1635,6 +1686,7 @@ export class AssetLoader {
 	 * Clean up resources
 	 */
 	public dispose(): void {
+		this.invalidateFluidFrames();
 		// Dispose of all textures
 		this.textureCache.forEach((texture) => texture.dispose());
 		this.textureCache.clear();

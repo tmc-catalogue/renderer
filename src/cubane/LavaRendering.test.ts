@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
+import JSZip from "jszip";
 import { AssetLoader } from "./AssetLoader";
 import { InstancedBlockRenderer } from "../InstancedBlockRenderer";
 import { liquidFrameTextures } from "../meshing/RecordRenderer";
@@ -56,9 +57,12 @@ describe("lava rendering", () => {
 			await loader.buildTextureAtlas();
 			updateFluidTime(0.5);
 			expect(material.uniforms.uTex.value).toBe(liquidFrameTextures.lava);
-			expect(material.uniforms.uTex.value).not.toBe(texture);
+			expect(material.uniforms.uTex.value).toBe(texture);
+			expect(createImageBitmap).toHaveBeenCalledOnce();
 			// A subsequent pack without lava must not retain the previous texture.
 			vi.mocked(loader.getResourceBlob).mockResolvedValue(undefined);
+			const zip = new JSZip().file("pack.mcmeta", "{}");
+			await loader.loadResourcePack(new Blob([await zip.generateAsync({ type: "arraybuffer" })]));
 			await loader.buildTextureAtlas();
 			expect(liquidFrameTextures.lava).toBeNull();
 			updateFluidTime(0.75);
@@ -68,6 +72,73 @@ describe("lava rendering", () => {
 			atlas.dispose();
 		}
 	);
+
+	it("shares concurrent fluid decodes, isolates failed assets, and releases owned textures", async () => {
+		const loader = new AssetLoader(false);
+		const atlas = new THREE.Texture();
+		(loader as any).textureAtlas = atlas;
+		vi.spyOn(loader as any, "loadColormaps").mockResolvedValue(undefined);
+		vi.spyOn(loader, "getResourceBlob").mockResolvedValue(new Blob(["image"]));
+		vi.spyOn(loader, "getResourceString").mockImplementation(async (path) =>
+			path.includes("lava_flow") ? '{"animation":{"width":3}}' : undefined
+		);
+		const close = vi.fn();
+		vi.stubGlobal(
+			"createImageBitmap",
+			vi
+				.fn()
+				.mockRejectedValueOnce(new Error("broken PNG"))
+				.mockResolvedValue({ width: 1, height: 1, close })
+		);
+		vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+			drawImage: vi.fn(),
+			getImageData: () => ({ data: new Uint8ClampedArray([255, 80, 0, 255]) }),
+		} as any);
+		expect(await Promise.all([loader.buildTextureAtlas(), loader.buildTextureAtlas()])).toEqual([
+			atlas,
+			atlas,
+		]);
+		expect(createImageBitmap).toHaveBeenCalledTimes(5);
+		expect(close).toHaveBeenCalledTimes(4);
+		expect(liquidFrameTextures.water).toBeNull();
+		expect(liquidFrameTextures.lavaFlow).toBeNull();
+		expect(liquidFrameTextures.lava).not.toBeNull();
+		const dispose = vi.fn();
+		liquidFrameTextures.lava!.addEventListener("dispose", dispose);
+		loader.dispose();
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(liquidFrameTextures.lava).toBeNull();
+	});
+
+	it("discards fluid textures that finish decoding after disposal", async () => {
+		const loader = new AssetLoader(false);
+		(loader as any).textureAtlas = new THREE.Texture();
+		vi.spyOn(loader as any, "loadColormaps").mockResolvedValue(undefined);
+		vi.spyOn(loader, "getResourceBlob").mockResolvedValue(new Blob(["image"]));
+		vi.spyOn(loader, "getResourceString").mockResolvedValue(undefined);
+		let finish!: (value: any) => void;
+		const decoded = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const started = Promise.withResolvers<void>();
+		vi.stubGlobal(
+			"createImageBitmap",
+			vi.fn(() => {
+				started.resolve();
+				return decoded;
+			})
+		);
+		vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+			drawImage: vi.fn(),
+			getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+		} as any);
+		const load = loader.buildTextureAtlas();
+		await started.promise;
+		loader.dispose();
+		finish({ width: 1, height: 1, close: vi.fn() });
+		await load;
+		expect(Object.values(liquidFrameTextures).every((value) => value === null)).toBe(true);
+	});
 
 	it.each(["initializeInstancedMeshes", "initializeInstancedMeshesMerged"] as const)(
 		"keeps lava opaque and preserves water alpha through %s",
