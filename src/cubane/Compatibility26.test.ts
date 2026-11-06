@@ -297,6 +297,52 @@ describe("26.3 resource-pack compatibility", () => {
 						}
 						expect(blackPixels).toBeGreaterThan(0);
 						expect(bluePixels).toBe(blackPixels);
+						// Check the model's actual board UVs, not just whether both colors
+						// exist somewhere in the baked canvas. Modern UVs use 0..16 units.
+						const variants = await new ModelResolver(assets).resolveBlockModel({
+							namespace: "minecraft",
+							name: `${wood}_${kind}`,
+							properties: { rotation: "3", facing: "east", attached: "true" },
+						});
+						let board: { south: number[]; north: number[] } | undefined;
+						let largestArea = 0;
+						for (const variant of variants) {
+							const model = await assets.getModel(variant.model);
+							for (const element of model.elements ?? []) {
+								const south = element.faces?.south?.uv,
+									north = element.faces?.north?.uv;
+								if (!south || !north) continue;
+								const area = Math.abs((south[2] - south[0]) * (south[3] - south[1]));
+								if (area > largestArea) {
+									board = { south, north };
+									largestArea = area;
+								}
+							}
+						}
+						if (!board) throw new Error(`No board UVs for ${wood}_${kind}`);
+						for (const side of ["south", "north"] as const) {
+							const [u0, v0, u1, v1] = board[side];
+							let sampledText = 0;
+							for (
+								let y = Math.round((Math.min(v0, v1) * pixels!.height) / 16);
+								y < Math.round((Math.max(v0, v1) * pixels!.height) / 16);
+								y++
+							) {
+								for (
+									let x = Math.round((Math.min(u0, u1) * pixels!.width) / 16);
+									x < Math.round((Math.max(u0, u1) * pixels!.width) / 16);
+									x++
+								) {
+									const index = (y * pixels!.width + x) * 4;
+									const [r, g, b] = pixels!.data.subarray(index, index + 3);
+									if (side === "south" ? r === 0 && g === 0 && b === 0 : b > r && b > g)
+										sampledText++;
+								}
+							}
+							expect(sampledText, `${wood}_${kind}/${side}`).toBe(
+								side === "south" ? blackPixels : bluePixels
+							);
+						}
 						const colors = new Set<string>();
 						for (let i = 0; i < pixels!.data.length; i += 4)
 							colors.add([...pixels!.data.slice(i, i + 3)].join(","));

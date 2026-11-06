@@ -768,10 +768,9 @@ export class SignRenderer {
 					lines.slice(0, 4).filter((l) => l !== "" && l.trim() !== "").length
 				);
 
-				// Regions are in the 64×32 *layout*; the actual sign texture may be higher
-				// resolution (HD packs use 128×64, 256×128, …). `px` converts layout pixels
-				// to base-texture pixels so the text lands where the board's UVs sample,
-				// instead of being squished into a corner (which doubled it onto one face).
+				// Regions use a virtual 64px-wide layout, including modern square sprites.
+				// `px` rescales both axes to the actual texture size before the canvas upscale,
+				// so the text lands inside the model's corresponding board UV rectangle.
 				const px = base.width / SIGN_TEXTURE_SIZE[0];
 
 				for (const [rx, ry, rw, rh] of sideRegions) {
