@@ -1,5 +1,8 @@
 import * as THREE from "three";
 import { AssetLoader } from "./AssetLoader";
+import { ModelResolver } from "./ModelResolver";
+import { BlockMeshBuilder } from "./BlockMeshBuilder";
+import { mergeOwnedStaticModelParts } from "../meshing/StaticModelParts";
 
 /**
  * Vanilla-accurate sign rendering for cubane.
@@ -35,6 +38,7 @@ const SIGN_WOODS = [
 	"cherry",
 	"bamboo",
 	"pale_oak",
+	"poplar",
 ];
 
 interface SignInfo {
@@ -95,8 +99,25 @@ export class SignRenderer {
 	private fontPromise: Promise<void> | null = null;
 	private basePixelCache = new Map<string, ImageData | null>();
 	private textureCache = new Map<string, THREE.Texture>();
+	private cacheGeneration = 0;
+	private disposed = false;
 
 	constructor(private assetLoader: AssetLoader) {}
+
+	/** Sign pixels, fonts and baked canvases all depend on the active resource pack. */
+	public clearCache(): void {
+		this.cacheGeneration++;
+		this.textureCache.forEach((texture) => texture.dispose());
+		this.textureCache.clear();
+		this.basePixelCache.clear();
+		this.fontData = null;
+		this.fontPromise = null;
+	}
+
+	public dispose(): void {
+		this.disposed = true;
+		this.clearCache();
+	}
 
 	/** Whether a block id (e.g. "minecraft:oak_wall_sign") is any kind of sign. */
 	public isSign(blockName: string): boolean {
@@ -113,15 +134,50 @@ export class SignRenderer {
 		properties: Record<string, string>,
 		nbtData?: Record<string, any>
 	): Promise<THREE.Object3D | null> {
+		while (!this.disposed) {
+			const generation = this.cacheGeneration;
+			let mesh: THREE.Object3D | null;
+			try {
+				mesh = await this.buildSignMeshForPack(blockName, properties, nbtData);
+			} catch (error) {
+				if (generation !== this.cacheGeneration) continue;
+				throw error;
+			}
+			if (generation === this.cacheGeneration) return mesh;
+			// A pack switch finished while decoding. Discard the obsolete mesh and retry.
+			mesh?.traverse((part) => {
+				if (!(part instanceof THREE.Mesh)) return;
+				part.geometry.dispose();
+				for (const material of Array.isArray(part.material) ? part.material : [part.material])
+					material.dispose();
+			});
+		}
+		return null;
+	}
+
+	private async buildSignMeshForPack(
+		blockName: string,
+		properties: Record<string, string>,
+		nbtData?: Record<string, any>
+	): Promise<THREE.Object3D | null> {
 		const info = this.detectSign(blockName, properties);
 		if (!info) return null;
 
+		// Modern packs provide block models and block textures, including attached chains.
+		const legacyPixels = await this.getBasePixels(info.texturePath);
+		if (this.disposed) return null;
+		if (!legacyPixels) {
+			return this.buildModernSign(blockName, properties, nbtData ?? {}, info);
+		}
 		const parts = this.buildParts(info);
 		const geometry = this.buildGeometry(parts, info.facingAngle);
 
 		const { lines, color, glowing } = this.extractSignText(nbtData ?? {});
 		const texture = await this.getSignTexture(info, lines, color, glowing);
-		if (!texture) return null;
+		if (!texture) {
+			geometry.dispose();
+			return null;
+		}
 
 		const material = new THREE.MeshStandardMaterial({
 			map: texture,
@@ -138,6 +194,72 @@ export class SignRenderer {
 		// coordinate, so no positional offset is needed.
 		const group = new THREE.Group();
 		group.add(mesh);
+		return group;
+	}
+
+	private async buildModernSign(
+		blockName: string,
+		properties: Record<string, string>,
+		nbt: Record<string, any>,
+		info: SignInfo
+	): Promise<THREE.Object3D | null> {
+		if (this.disposed) return null;
+		const generation = this.cacheGeneration;
+		const texturePath = `block/${info.wood}_${info.isHanging ? "hanging_sign" : "sign"}`;
+		const base = await this.getBasePixels(texturePath);
+		if (!base || this.disposed) return null;
+		const front = this.extractSignText(nbt);
+		const back = this.extractSignText({ front_text: nbt.back_text ?? nbt.Text?.back_text });
+		const key = JSON.stringify([texturePath, front, back]);
+		let texture = this.textureCache.get(key);
+		if (!texture) {
+			// Regions are expressed in the legacy compositor's 64px coordinate space.
+			const frontRegion: [number, number, number, number] = info.isHanging
+				? [4, 32, 28, 20]
+				: [0, 4, 48, 24];
+			const backRegion: [number, number, number, number] = info.isHanging
+				? [36, 32, 28, 20]
+				: [0, 32, 48, 24];
+			const canvas = await this.compositeSignWithText(
+				base,
+				info,
+				front.lines,
+				front.color,
+				front.glowing,
+				[frontRegion],
+				[{ ...back, regions: [backRegion] }]
+			);
+			if (generation !== this.cacheGeneration || this.disposed) return null;
+			texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
+			texture.magFilter = THREE.NearestFilter;
+			texture.minFilter = THREE.NearestFilter;
+			texture.generateMipmaps = false;
+			texture.colorSpace = THREE.NoColorSpace;
+			this.textureCache.set(key, texture);
+		}
+		const block = { namespace: "minecraft", name: blockName.replace("minecraft:", ""), properties };
+		const resolver = new ModelResolver(this.assetLoader);
+		const builder = new BlockMeshBuilder(this.assetLoader, { useAtlas: false });
+		const group = new THREE.Group();
+		for (const variant of await resolver.resolveBlockModel(block)) {
+			const model = await this.assetLoader.getModel(variant.model);
+			const part = await builder.createBlockMeshNoWater(model, variant, block);
+			part.traverse((object) => {
+				if (!(object instanceof THREE.Mesh)) return;
+				const material = object.material as THREE.MeshStandardMaterial;
+				if (material.userData.texturePath?.replace("minecraft:", "") === texturePath) {
+					material.map = texture;
+					material.needsUpdate = true;
+				}
+			});
+			part.rotation.set(
+				(-(variant.x ?? 0) * Math.PI) / 180,
+				(-(variant.y ?? 0) * Math.PI) / 180,
+				0
+			);
+			group.add(part);
+		}
+		mergeOwnedStaticModelParts(group);
 		return group;
 	}
 
@@ -489,13 +611,15 @@ export class SignRenderer {
 		color: string,
 		glowing: boolean
 	): Promise<THREE.Texture | null> {
+		if (this.disposed) return null;
+		const generation = this.cacheGeneration;
 		const hasText = lines.some((l) => l.trim() !== "");
 		const cacheKey = `${info.texturePath}|${info.isHanging}|${info.isWall}|${color}|${glowing}|${hasText ? lines.join(" ") : ""}`;
 		const cached = this.textureCache.get(cacheKey);
 		if (cached) return cached;
 
 		const base = await this.getBasePixels(info.texturePath);
-		if (!base) return null;
+		if (!base || this.disposed) return null;
 
 		let canvas: HTMLCanvasElement | OffscreenCanvas;
 		if (!hasText) {
@@ -504,6 +628,7 @@ export class SignRenderer {
 			canvas = await this.compositeSignWithText(base, info, lines, color, glowing);
 		}
 
+		if (generation !== this.cacheGeneration || this.disposed) return null;
 		const texture = new THREE.CanvasTexture(canvas as HTMLCanvasElement);
 		texture.flipY = false; // canvas top-left origin matches our top-left UVs
 		texture.magFilter = THREE.NearestFilter;
@@ -519,9 +644,12 @@ export class SignRenderer {
 	}
 
 	private async getBasePixels(texturePath: string): Promise<ImageData | null> {
+		if (this.disposed) return null;
 		if (this.basePixelCache.has(texturePath)) return this.basePixelCache.get(texturePath)!;
+		const generation = this.cacheGeneration;
 		const data = await this.assetLoader.getTexturePixels(texturePath);
-		this.basePixelCache.set(texturePath, data);
+		if (!this.disposed && generation === this.cacheGeneration)
+			this.basePixelCache.set(texturePath, data);
 		return data;
 	}
 
@@ -545,11 +673,13 @@ export class SignRenderer {
 	// ── Text compositing (port of sign_text.rs) ─────────────────────────────────
 
 	private async ensureFont(): Promise<void> {
+		if (this.disposed) return;
 		if (this.fontData) return;
 		if (!this.fontPromise) {
+			const generation = this.cacheGeneration;
 			this.fontPromise = (async () => {
 				const tex = await this.assetLoader.getTexturePixels("font/ascii");
-				if (!tex) return;
+				if (!tex || this.disposed || generation !== this.cacheGeneration) return;
 				const width = tex.width;
 				const height = tex.height;
 				const cellW = Math.floor(width / 16);
@@ -585,7 +715,14 @@ export class SignRenderer {
 		info: SignInfo,
 		lines: string[],
 		color: string,
-		glowing: boolean
+		glowing: boolean,
+		customRegions?: [number, number, number, number][],
+		additionalText: {
+			lines: string[];
+			color: string;
+			glowing: boolean;
+			regions: [number, number, number, number][];
+		}[] = []
 	): Promise<HTMLCanvasElement | OffscreenCanvas> {
 		await this.ensureFont();
 		const scale = 4;
@@ -610,69 +747,72 @@ export class SignRenderer {
 		const font = this.fontData;
 		if (font) {
 			// Text regions (x,y,w,h) in base-texture pixels — board front (± back).
-			const regions: [number, number, number, number][] = info.isHanging
-				? [
-						[2, 14, 14, 10],
-						[18, 14, 14, 10],
-					]
-				: info.isWall
+			const regions: [number, number, number, number][] =
+				customRegions ??
+				(info.isHanging
 					? [
-							[2, 2, 24, 12],
-							[28, 2, 24, 12],
+							[2, 14, 14, 10],
+							[18, 14, 14, 10],
 						]
-					: [[2, 2, 24, 12]];
+					: info.isWall
+						? [
+								[2, 2, 24, 12],
+								[28, 2, 24, 12],
+							]
+						: [[2, 2, 24, 12]]);
 
-			const nonEmpty = Math.max(
-				1,
-				lines.slice(0, 4).filter((l) => l !== "" && l.trim() !== "").length
-			);
-
-			// Regions are in the 64×32 *layout*; the actual sign texture may be higher
-			// resolution (HD packs use 128×64, 256×128, …). `px` converts layout pixels
-			// to base-texture pixels so the text lands where the board's UVs sample,
-			// instead of being squished into a corner (which doubled it onto one face).
-			const px = base.width / SIGN_TEXTURE_SIZE[0];
-
-			for (const [rx, ry, rw, rh] of regions) {
-				const textX0 = Math.round(rx * px * scale);
-				const textY0 = Math.round(ry * px * scale);
-				const textW = Math.round(rw * px * scale);
-				const textH = Math.round(rh * px * scale);
-				const lineHeight = Math.floor(textH / 4);
-				const glyphScale = Math.max(
+			const textSides = [{ lines, color, glowing, regions }, ...additionalText];
+			for (const { lines, color, glowing, regions: sideRegions } of textSides) {
+				const nonEmpty = Math.max(
 					1,
-					Math.floor(Math.min(lineHeight, Math.floor((font.cellH * scale) / 2)) / font.cellH)
+					lines.slice(0, 4).filter((l) => l !== "" && l.trim() !== "").length
 				);
-				const vOffset = Math.floor((Math.max(0, 4 - nonEmpty) * lineHeight) / 2);
 
-				let visibleIdx = 0;
-				for (const line of lines.slice(0, 4)) {
-					if (line === "" || line.trim() === "") continue;
-					const yStart = textY0 + vOffset + visibleIdx * lineHeight;
-					visibleIdx++;
+				// Regions use a virtual 64px-wide layout, including modern square sprites.
+				// `px` rescales both axes to the actual texture size before the canvas upscale,
+				// so the text lands inside the model's corresponding board UV rectangle.
+				const px = base.width / SIGN_TEXTURE_SIZE[0];
 
-					const segments = this.parseTextComponent(line, color);
-					if (segments.length === 0) continue;
-
-					const totalWidth = this.segmentsWidth(segments, font, glyphScale);
-					const xOffset =
-						totalWidth < textW ? textX0 + Math.floor((textW - totalWidth) / 2) : textX0;
-
-					this.renderSegments(
-						out,
-						outW,
-						font,
-						glyphScale,
-						segments,
-						xOffset,
-						yStart,
-						textX0 + textW,
-						glowing
+				for (const [rx, ry, rw, rh] of sideRegions) {
+					const textX0 = Math.round(rx * px * scale);
+					const textY0 = Math.round(ry * px * scale);
+					const textW = Math.round(rw * px * scale);
+					const textH = Math.round(rh * px * scale);
+					const lineHeight = Math.floor(textH / 4);
+					const glyphScale = Math.max(
+						1,
+						Math.floor(Math.min(lineHeight, Math.floor((font.cellH * scale) / 2)) / font.cellH)
 					);
+					const vOffset = Math.floor((Math.max(0, 4 - nonEmpty) * lineHeight) / 2);
+
+					let visibleIdx = 0;
+					for (const line of lines.slice(0, 4)) {
+						if (line === "" || line.trim() === "") continue;
+						const yStart = textY0 + vOffset + visibleIdx * lineHeight;
+						visibleIdx++;
+
+						const segments = this.parseTextComponent(line, color);
+						if (segments.length === 0) continue;
+
+						const totalWidth = this.segmentsWidth(segments, font, glyphScale);
+						const xOffset =
+							totalWidth < textW ? textX0 + Math.floor((textW - totalWidth) / 2) : textX0;
+
+						this.renderSegments(
+							out,
+							outW,
+							font,
+							glyphScale,
+							segments,
+							xOffset,
+							yStart,
+							textX0 + textW,
+							glowing
+						);
+					}
 				}
 			}
 		}
-
 		const canvas = this.makeCanvas(outW, outH);
 		const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
 		ctx.putImageData(new ImageData(out, outW, outH), 0, 0);

@@ -11,7 +11,14 @@ import * as THREE from "three";
 
 export type ChestType = "single" | "left" | "right";
 export type ChestFacing = "north" | "east" | "south" | "west";
-export type ChestKind = "normal" | "trapped" | "ender";
+export type ChestKind =
+	| "normal"
+	| "trapped"
+	| "ender"
+	| "copper"
+	| "copper_exposed"
+	| "copper_weathered"
+	| "copper_oxidized";
 
 type ChestFaceDir = "down" | "up" | "north" | "south" | "west" | "east";
 type UV4 = readonly [number, number, number, number];
@@ -286,7 +293,7 @@ export const CHEST_FACING_THETA: Record<ChestFacing, number> = {
 
 export function chestTexturePath(kind: ChestKind, type: ChestType): string {
 	if (kind === "ender") return "entity/chest/ender";
-	const base = kind === "trapped" ? "entity/chest/trapped" : "entity/chest/normal";
+	const base = `entity/chest/${kind}`;
 	return type === "single" ? base : `${base}_${type}`;
 }
 
@@ -347,6 +354,12 @@ function chestKindOf(bucket: { state: unknown; chest?: unknown }): ChestKind | n
 	const name = `${chestStateName(bucket.state)} ${hint}`.toLowerCase();
 	if (name.includes("ender_chest") || hint === "ender") return "ender";
 	if (name.includes("trapped_chest") || hint === "trapped") return "trapped";
+	if (name.includes("copper_chest")) {
+		if (name.includes("oxidized")) return "copper_oxidized";
+		if (name.includes("weathered")) return "copper_weathered";
+		if (name.includes("exposed")) return "copper_exposed";
+		return "copper";
+	}
 	if (name.includes("chest") || hint === "normal" || bucket.chest === true) return "normal";
 	return null;
 }

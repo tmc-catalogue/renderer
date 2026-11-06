@@ -16,9 +16,14 @@ export class BlockMeshBuilder {
 	// When false (default), blocks Cubane can't build render nothing instead of
 	// a purple debug placeholder. Set via debugOptions.showUnknownBlocks.
 	private showUnknownBlocks: boolean;
+	private useAtlas: boolean;
 
-	constructor(assetLoader: AssetLoader, options: { showUnknownBlocks?: boolean } = {}) {
+	constructor(
+		assetLoader: AssetLoader,
+		options: { showUnknownBlocks?: boolean; useAtlas?: boolean } = {}
+	) {
 		this.assetLoader = assetLoader;
+		this.useAtlas = options.useAtlas ?? true;
 		this.showUnknownBlocks = options.showUnknownBlocks ?? false;
 	}
 
@@ -366,7 +371,10 @@ export class BlockMeshBuilder {
 		// Process each face using the SAME logic as the working original
 		for (const [direction, sourceFace] of Object.entries(element.faces)) {
 			if (!sourceFace) continue;
-			const faceData = this.withDefaultUV(sourceFace, element, direction);
+			const faceData = {
+				...this.withDefaultUV(sourceFace, element, direction),
+				light_emission: element.light_emission,
+			};
 
 			// Create a temporary PlaneGeometry to get the correct vertex positions and UVs
 			const tempFaceResult = await this.createTempFaceGeometry(
@@ -595,6 +603,7 @@ export class BlockMeshBuilder {
 	}
 
 	private shouldUseAtlas(): boolean {
+		if (!this.useAtlas) return false;
 		// Check if atlas is available
 		const atlas = this.assetLoader.getTextureAtlas();
 		if (!atlas) {
@@ -941,7 +950,10 @@ export class BlockMeshBuilder {
 		for (const direction of faceDirections) {
 			const sourceFace = element.faces[direction];
 			if (!sourceFace) continue;
-			const faceData = this.withDefaultUV(sourceFace, element, direction);
+			const faceData = {
+				...this.withDefaultUV(sourceFace, element, direction),
+				light_emission: element.light_emission,
+			};
 
 			// Create the face geometry (reuse existing logic)
 			const { geometry, material } = await this.createFaceGeometry(
@@ -1095,7 +1107,7 @@ export class BlockMeshBuilder {
 			? JSON.stringify(blockData.properties) // Consider sorted stringify for consistency
 			: "none";
 
-		return `${texturePath}_dir:${direction}_tint:${tintIndex}_cull:${cullFace}_block:${blockId}_props:${props}_biome:${biome}`;
+		return `${texturePath}_dir:${direction}_tint:${tintIndex}_cull:${cullFace}_block:${blockId}_props:${props}_biome:${biome}_emission:${faceData.light_emission ?? 0}`;
 	}
 
 	private async createFaceMaterial(
@@ -1135,6 +1147,7 @@ export class BlockMeshBuilder {
 			// Material options for AssetLoader
 			const materialOptions: any = {
 				tint: tint,
+				lightEmission: faceData.light_emission,
 				isLiquid: isLiquid,
 				isWater: isWater,
 				isLava: isLava,

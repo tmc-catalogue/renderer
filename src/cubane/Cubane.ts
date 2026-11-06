@@ -738,7 +738,8 @@ export class Cubane {
 
 		if (useCache && this.blockMeshCache.has(cacheKey)) {
 			const cachedMesh = this.blockMeshCache.get(cacheKey)!;
-			return cachedMesh.clone(); // Return a clone for safety
+			// Clone the hierarchy; geometry and materials remain shared template resources.
+			return cachedMesh.clone();
 		}
 
 		const block = this.parseBlockString(blockString);
@@ -761,13 +762,26 @@ export class Cubane {
 			// Fall through to default handling if the sign couldn't be built.
 		}
 
-		if (/^minecraft:(chest|trapped_chest|ender_chest)$/.test(blockId)) {
+		if (
+			/^minecraft:(chest|trapped_chest|ender_chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest)$/.test(
+				blockId
+			)
+		) {
 			const { buildChestBlockMesh } = await import("../meshing/ChestModels");
 			const chest = await buildChestBlockMesh(blockString, this.assetLoader);
 			if (chest) {
 				if (useCache) this.blockMeshCache.set(cacheKey, chest.clone());
 				return chest;
 			}
+		}
+
+		if (
+			/^minecraft:(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_golem_statue$/.test(blockId)
+		) {
+			const { buildCopperGolemStatue } = await import("../meshing/CopperGolemModels");
+			const statue = await buildCopperGolemStatue(blockId, block.properties, this.assetLoader);
+			if (useCache) this.blockMeshCache.set(cacheKey, statue.clone());
+			return statue;
 		}
 
 		if (this.pureBlockEntityMap[blockId]) {
@@ -965,6 +979,7 @@ export class Cubane {
 	 * Clear all mesh caches
 	 */
 	public clearMeshCaches(): void {
+		this.signRenderer.clearCache();
 		this.blockMeshCache.clear();
 		this.entityMeshCache.clear();
 		this.optimizationDataCache.clear();
@@ -1384,5 +1399,6 @@ export class Cubane {
 	public dispose(): void {
 		this.assetLoader.dispose();
 		this.clearMeshCaches();
+		this.signRenderer.dispose();
 	}
 }

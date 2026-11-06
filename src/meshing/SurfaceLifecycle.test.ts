@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import { SchematicObject } from "../managers/SchematicObject";
+import { buildFluidMeshes, disposeFluidMeshes, setFluidTextures } from "./WaterMesher";
+import { createFluidFrameTexture } from "./WaterTextures";
 import { SurfaceIndex } from "./SurfaceIndex";
 vi.mock("nucleation", () => ({ default: vi.fn(), SchematicWrapper: class {} }));
 vi.mock("../workers/MeshBuilder.worker?worker&inline", () => ({ default: class {} }));
@@ -324,5 +326,30 @@ describe("surface edit lifecycle", () => {
 		expect(object.hasSurfacesInView(frustum)).toBe(false);
 		object.group.clear();
 		expect(object.hasSurfacesInView(frustum)).toBe(false);
+	});
+	it("schedules animated fluids only while visible, including meshes without portal clip uniforms", () => {
+		const { object } = schematic();
+		const texture = createFluidFrameTexture(new Uint8ClampedArray(8), 1, 2, { animation: {} });
+		setFluidTextures({ water: texture });
+		const { meshes } = buildFluidMeshes(() => "water", 1, 1, 1);
+		object.group.add(...meshes);
+		object.animatedSurfaces = meshes;
+		const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 10);
+		camera.position.set(0, 2, 3);
+		camera.lookAt(0, 0, 0);
+		camera.updateMatrixWorld();
+		const frustum = new THREE.Frustum().setFromProjectionMatrix(
+			new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+		);
+		expect(meshes[0].userData.animatedSurface).toBe(true);
+		expect(object.hasSurfacesInView(frustum)).toBe(true);
+		object.group.position.x = 100;
+		expect(object.hasSurfacesInView(frustum)).toBe(false);
+		object.group.position.x = 0;
+		object.group.visible = false;
+		expect(object.hasSurfacesInView(frustum)).toBe(false);
+		disposeFluidMeshes(meshes);
+		texture.dispose();
+		setFluidTextures(null);
 	});
 });

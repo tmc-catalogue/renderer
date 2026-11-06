@@ -8,7 +8,8 @@ import {
 	setFluidTextures,
 	updateFluidTime,
 } from "./WaterMesher";
-import { createWaterFrameTexture, tintWaterPixels } from "./WaterTextures";
+import { createFluidFrameTexture, tintWaterPixels } from "./WaterTextures";
+import { registerFluidAnimation } from "./FluidAnimation";
 import { withoutFluidGeometry } from "./FluidGeometry";
 
 const meshes: THREE.Mesh[] = [];
@@ -61,9 +62,9 @@ describe("water surfaces", () => {
 
 	it("keeps source and falling-water heights and solid-neighbor culling", () => {
 		const source = build(["water[level=0]"]).meshes[0].geometry;
-		expect(source.boundingBox!.max.y).toBeCloseTo(8 / 9 - 0.5);
+		expect(source.boundingBox!.max.y).toBeCloseTo(((8 / 9) * 10) / 12 - 0.5 - 1 / 1024);
 		const falling = build(["water[level=8]"]).meshes[0].geometry;
-		expect(falling.boundingBox!.max.y).toBe(0.5);
+		expect(falling.boundingBox!.max.y).toBeCloseTo(source.boundingBox!.max.y);
 		const solid = build(["water", "stone"]).meshes[0].geometry;
 		expect(solid.index!.count).toBe(5 * 6);
 	});
@@ -86,16 +87,18 @@ describe("water surfaces", () => {
 	it("animates still/flow textures at their native rates and removes disposed materials", () => {
 		const still = new THREE.DataArrayTexture(new Uint8Array(16), 1, 1, 4);
 		const flow = new THREE.DataArrayTexture(new Uint8Array(32), 1, 1, 8);
+		registerFluidAnimation(still, { animation: { frametime: 2 } });
+		registerFluidAnimation(flow, { animation: {} });
 		setFluidTextures({ water: still, waterFlow: flow });
 		const water = material("water");
 		updateFluidTime(0.125);
 		expect(water.uniforms.uTex.value).toBe(still);
 		expect(water.uniforms.uFlowTex.value).toBe(flow);
-		expect(water.uniforms.uStillFrame.value.toArray()).toEqual([1, 2, 0.25]);
-		expect(water.uniforms.uFlowFrame.value.toArray()).toEqual([2, 3, 0.5]);
+		expect(water.uniforms.uStillFrame.value.toArray()).toEqual([1, 2, 0]);
+		expect(water.uniforms.uFlowFrame.value.toArray()).toEqual([2, 3, 0]);
 		water.dispose();
 		updateFluidTime(1);
-		expect(water.uniforms.uTime.value).toBe(0.125);
+		expect(water.uniforms.uStillFrame.value.x).toBe(1);
 	});
 
 	it("supports a missing flow texture and resets removed resource packs", () => {
@@ -114,6 +117,7 @@ describe("water surfaces", () => {
 		setFluidTextures(source);
 		const water = material("water");
 		const flow = new THREE.DataArrayTexture(new Uint8Array(8), 1, 1, 2);
+		registerFluidAnimation(flow, { animation: {} });
 		source.waterFlow = flow;
 		updateFluidTime(0.05);
 		expect(water.uniforms.uFlowTex.value).toBe(flow);
@@ -138,10 +142,10 @@ describe("water textures", () => {
 	it("supports static packs and independent repeatable animation frames", () => {
 		for (const frames of [1, 3]) {
 			const pixels = new Uint8ClampedArray(2 * 2 * 4 * frames).fill(127);
-			const texture = createWaterFrameTexture(pixels, 2, 2 * frames);
+			const texture = createFluidFrameTexture(pixels, 2, 2 * frames, { animation: {} });
 			expect(texture.image.depth).toBe(frames);
 			expect(texture.image.data).toEqual(new Uint8Array(pixels));
-			expect(texture.wrapS).toBe(THREE.RepeatWrapping);
+			expect(texture.wrapS).toBe(THREE.ClampToEdgeWrapping);
 			expect(texture.magFilter).toBe(THREE.NearestFilter);
 			texture.dispose();
 		}

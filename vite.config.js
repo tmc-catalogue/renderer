@@ -66,7 +66,8 @@ export default defineConfig({
     exclude: ['nucleation', '@wasm/minecraft_schematic_utils', '@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
   worker: {
-    format: 'es',
+    // Vite 4 inline workers are classic scripts; ES output leaves import.meta in the WASM glue.
+    format: 'iife',
     plugins: [wasmInlinePlugin()],
   },
   test: {

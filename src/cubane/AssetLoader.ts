@@ -5,7 +5,16 @@ import { TintManager } from "./TintManager";
 import { BlockModel, BlockStateDefinition } from "./types";
 import { AtlasBuilder } from "./AtlasBuilder";
 import { ResourcePackManager } from "./ResourcePackManager";
-import { createWaterFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
+import { createFluidFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
+import type { FluidTextures } from "../meshing/WaterMesher";
+
+const FLUID_TEXTURES = [
+	["water", "water_still"],
+	["waterFlow", "water_flow"],
+	["lava", "lava_still"],
+	["lavaFlow", "lava_flow"],
+	["waterOverlay", "water_overlay"],
+] as const;
 
 export class AssetLoader {
 	private resourcePacks: Map<string, JSZip> = new Map();
@@ -23,6 +32,12 @@ export class AssetLoader {
 	private modelCache: Map<string, BlockModel> = new Map();
 	private textureCache: Map<string, THREE.Texture> = new Map();
 	private materialCache: Map<string, THREE.Material> = new Map();
+	private resourceGeneration = 0;
+	private fluidFramesLoad: {
+		promise: Promise<void>;
+		textures: FluidTextures;
+		registry?: FluidTextures;
+	} | null = null;
 
 	// Texture loader
 	private textureLoader = new THREE.TextureLoader();
@@ -35,7 +50,7 @@ export class AssetLoader {
 	// layout rules, liquid frame harvests) — the pack hash alone can't see code
 	// generations, so stale atlases served across upgrades (the "yellow water"
 	// class of bug: new code sampling an old-layout cache)
-	private static readonly ATLAS_FORMAT_VERSION = 2;
+	private static readonly ATLAS_FORMAT_VERSION = 3;
 	private resourcePackHash: string = "";
 	private cacheEnabled: boolean = true;
 
@@ -49,6 +64,7 @@ export class AssetLoader {
 	 * Connect to a ResourcePackManager for managed pack loading
 	 */
 	public setPackManager(manager: ResourcePackManager): void {
+		this.invalidatePackAssets();
 		this.packManager = manager;
 		this.usePackManager = true;
 
@@ -63,34 +79,48 @@ export class AssetLoader {
 	 */
 	private async rebuildFromPackManager(): Promise<void> {
 		if (!this.packManager) return;
+		this.invalidatePackAssets();
+
+		// Recalculate hash from enabled packs for cache key
+		const generation = this.resourceGeneration;
+		const enabledPacks = this.packManager.getEnabledPacks();
+		const packHashes = enabledPacks.map((p) => p.hash);
+		const hash = await this.hashString(packHashes.join(":"));
+		if (generation !== this.resourceGeneration) return;
+		this.resourcePackHash = hash;
+
+		await this.buildTextureAtlas();
+	}
+
+	/** Release all assets derived from the previous pack stack. */
+	private invalidatePackAssets(): void {
+		this.resourceGeneration++;
+		this.resourcePackHash = "";
+		this.invalidateFluidFrames();
 
 		// Clear caches that depend on pack content
 		this.stringCache.clear();
 		this.blockStateCache.clear();
 		this.modelCache.clear();
 
-		this.textureCache.forEach((t) => t.dispose());
+		const textures = new Set([
+			...this.textureCache.values(),
+			...this.animatedTextureManager.clear(),
+		]);
+		textures.forEach((t) => t.dispose());
 		this.textureCache.clear();
 
 		this.materialCache.forEach((m) => m.dispose());
 		this.materialCache.clear();
 
 		// Force colormaps to reload from the newly-enabled packs.
-		this.colormapsLoaded = false;
+		this.invalidateColormaps();
 
 		if (this.textureAtlas) {
 			this.textureAtlas.dispose();
 			this.textureAtlas = null;
 		}
 		this.textureUVMap.clear();
-
-		// Recalculate hash from enabled packs for cache key
-		const enabledPacks = this.packManager.getEnabledPacks();
-		const packHashes = enabledPacks.map((p) => p.hash);
-		this.resourcePackHash = await this.hashString(packHashes.join(":"));
-
-		// Rebuild atlas
-		await this.buildTextureAtlas();
 	}
 
 	/**
@@ -139,18 +169,16 @@ export class AssetLoader {
 	 * Load a resource pack from a blob
 	 */
 	public async loadResourcePack(blob: Blob): Promise<void> {
+		if (this.usePackManager && this.packManager) {
+			await this.packManager.loadPackFromBlob(blob);
+			return;
+		}
 		try {
 			console.log("🔍 Loading resource pack from blob...");
 
 			// Ensure fully loaded and safe Blob
 			const arrayBuffer = await blob.arrayBuffer();
 			console.log("📦 Blob size:", arrayBuffer.byteLength, "type:", blob.type);
-
-			// Calculate hash for caching
-			if (this.cacheEnabled) {
-				this.resourcePackHash = await this.calculateResourcePackHash(arrayBuffer);
-				console.log("🔑 Resource pack hash:", this.resourcePackHash.substring(0, 16) + "...");
-			}
 
 			// Optional: Verify ZIP signature at start
 			const header = new Uint8Array(arrayBuffer.slice(0, 4));
@@ -182,9 +210,18 @@ export class AssetLoader {
 			console.log("📁 textures:", textures.length);
 
 			// Register pack
-			const packId = `pack_${Date.now()}`;
+			// Include the fallback stack in the key; the same override can produce
+			// different atlases over different base packs. Failed loads leave it intact.
+			const hash = this.cacheEnabled
+				? await this.hashString(
+						`${this.resourcePackHash}:${await this.calculateResourcePackHash(arrayBuffer)}`
+					)
+				: "";
+			const packId = `pack_${this.resourceGeneration}`;
 			this.resourcePacks.set(packId, zip);
 			this.resourcePackOrder.unshift(packId);
+			this.invalidatePackAssets();
+			this.resourcePackHash = hash;
 		} catch (error) {
 			console.error("❌ Failed to load resource pack:", error);
 			throw error;
@@ -214,6 +251,7 @@ export class AssetLoader {
 		path: string,
 		silent: boolean = true
 	): Promise<string | undefined> {
+		const generation = this.resourceGeneration;
 		// Check cache first
 		const cacheKey = `string:${path}`;
 		if (this.stringCache.has(cacheKey)) {
@@ -226,6 +264,7 @@ export class AssetLoader {
 			if (file) {
 				try {
 					const content = await file.async("string");
+					if (generation !== this.resourceGeneration) return this.getResourceString(path, silent);
 					this.stringCache.set(cacheKey, content);
 					return content;
 				} catch (error) {
@@ -266,6 +305,7 @@ export class AssetLoader {
 	 * Get a block state definition
 	 */
 	public async getBlockState(blockId: string): Promise<BlockStateDefinition> {
+		const generation = this.resourceGeneration;
 		// Remove minecraft: prefix if present
 		blockId = blockId.replace("minecraft:", "");
 
@@ -283,6 +323,7 @@ export class AssetLoader {
 			const alias = blockId === "iron_chain" ? "chain" : "iron_chain";
 			jsonString = await this.getResourceString(`blockstates/${alias}.json`);
 		}
+		if (generation !== this.resourceGeneration) return this.getBlockState(blockId);
 		if (!jsonString) {
 			console.warn(`Block state definition for ${blockId} not found.`);
 			return {} as BlockStateDefinition;
@@ -299,6 +340,7 @@ export class AssetLoader {
 	}
 
 	public async getModel(modelPath: string): Promise<BlockModel> {
+		const generation = this.resourceGeneration;
 		// Remove minecraft: prefix if present
 		modelPath = modelPath.replace("minecraft:", "");
 
@@ -386,12 +428,14 @@ export class AssetLoader {
 			}
 
 			// Cache and return the enhanced model
+			if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 			this.modelCache.set(cacheKey, liquidModel);
 			return liquidModel;
 		}
 
 		// For non-liquid models, load from resource pack
 		const jsonString = await this.getResourceString(`models/${modelPath}.json`);
+		if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 		if (!jsonString) {
 			console.warn(`Model definition for ${modelPath} not found.`);
 			return {} as BlockModel;
@@ -404,6 +448,7 @@ export class AssetLoader {
 			// If the model has a parent, we need to merge with it
 			if (model.parent) {
 				const mergedModel = await this.loadAndMergeModel(model);
+				if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 				this.modelCache.set(cacheKey, mergedModel);
 				return mergedModel;
 			}
@@ -527,6 +572,7 @@ export class AssetLoader {
 	}
 
 	public async getTexture(texturePath: string): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Handle missing texture path
 		if (
 			!texturePath ||
@@ -545,9 +591,11 @@ export class AssetLoader {
 
 		// Check for animation
 		const isAnimated = await this.animatedTextureManager.isAnimated(`textures/${texturePath}`);
+		if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 
 		if (isAnimated) {
 			const animatedTexture = await this.animatedTextureManager.createAnimatedTexture(texturePath);
+			if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 			if (animatedTexture) {
 				console.log(`Successfully created animated texture for ${texturePath}`);
 				this.textureCache.set(cacheKey, animatedTexture);
@@ -564,6 +612,7 @@ export class AssetLoader {
 
 		// Load texture blob from resource pack
 		const blob = await this.getResourceBlob(`textures/${fullPath}`);
+		if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 		if (!blob) {
 			console.warn(`Texture blob not found for ${texturePath}`);
 
@@ -572,9 +621,10 @@ export class AssetLoader {
 				// Try without the "block/" prefix
 				const altPath = texturePath.replace("block/", "");
 				const altBlob = await this.getResourceBlob(`textures/${altPath}.png`);
+				if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 				if (altBlob) {
 					// Continue with this blob
-					return this.createTextureFromBlob(altBlob, cacheKey);
+					return this.createTextureFromBlob(altBlob, cacheKey, texturePath);
 				}
 			}
 
@@ -591,6 +641,7 @@ export class AssetLoader {
 		cacheKey: string,
 		texturePath: string = ""
 	): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Convert blob to data URL
 		const url = URL.createObjectURL(blob);
 
@@ -618,6 +669,10 @@ export class AssetLoader {
 				);
 			});
 
+			if (generation !== this.resourceGeneration) {
+				texture.dispose();
+				return this.getTexture(texturePath);
+			}
 			this.textureCache.set(cacheKey, texture);
 
 			return texture;
@@ -641,7 +696,13 @@ export class AssetLoader {
 		return this.animatedTextureManager.hasActiveTextures();
 	}
 
-	private colormapsLoaded = false;
+	private colormapLoad: Promise<void> | null = null;
+	private colormapGeneration = 0;
+
+	private invalidateColormaps(): void {
+		this.colormapGeneration++;
+		this.colormapLoad = null;
+	}
 
 	/**
 	 * Load Minecraft's grass/foliage colormaps from the active resource pack and
@@ -649,15 +710,24 @@ export class AssetLoader {
 	 * If the pack ships no colormaps the TintManager falls back to sane defaults.
 	 * Guarded so it only decodes once per atlas (re)build.
 	 */
-	public async loadColormaps(): Promise<void> {
-		if (this.colormapsLoaded) return;
-		this.colormapsLoaded = true;
-
-		const [grass, foliage] = await Promise.all([
+	public loadColormaps(): Promise<void> {
+		if (this.colormapLoad) return this.colormapLoad;
+		const generation = this.colormapGeneration;
+		const load = Promise.all([
 			this.loadColormapImageData("colormap/grass"),
 			this.loadColormapImageData("colormap/foliage"),
-		]);
-		this.tintManager.setColormaps(grass, foliage);
+			this.loadColormapImageData("colormap/dry_foliage"),
+		])
+			.then(([grass, foliage, dryFoliage]) => {
+				if (generation === this.colormapGeneration)
+					this.tintManager.setColormaps(grass, foliage, dryFoliage);
+			})
+			.catch((error) => {
+				if (this.colormapLoad === load) this.colormapLoad = null;
+				throw error;
+			});
+		this.colormapLoad = load;
+		return load;
 	}
 
 	private async loadColormapImageData(texturePath: string): Promise<ImageData | null> {
@@ -834,6 +904,7 @@ export class AssetLoader {
 		texturePath: string,
 		options: {
 			transparent?: boolean;
+			lightEmission?: number;
 			tint?: THREE.Color;
 			isLiquid?: boolean;
 			isWater?: boolean;
@@ -847,12 +918,14 @@ export class AssetLoader {
 			useAtlas?: boolean;
 		} = {}
 	): Promise<THREE.Material> {
+		const generation = this.resourceGeneration;
 		const useAtlas = options.useAtlas ?? true;
 
 		// Create cache key
 		const cacheKey = `material:${texturePath}:${useAtlas ? "atlas" : "individual"}:${JSON.stringify(
 			{
 				transparent: options.transparent,
+				lightEmission: options.lightEmission,
 				isLiquid: options.isLiquid,
 				isWater: options.isWater,
 				isLava: options.isLava,
@@ -995,11 +1068,18 @@ export class AssetLoader {
 			if (options.isWater) {
 				materialOptions.opacity = options.opacity ?? WATER_OPACITY;
 			} else if (options.isLava) {
-				materialOptions.opacity = 0.9;
+				materialOptions.transparent = false;
+				materialOptions.depthWrite = true;
+				materialOptions.opacity = 1;
 				materialOptions.emissive = new THREE.Color(0x331100);
 			}
 		}
 
+		if (options.lightEmission) {
+			materialOptions.emissiveMap = texture;
+			materialOptions.emissive = new THREE.Color(0xffffff);
+			materialOptions.emissiveIntensity = Math.min(15, Math.max(0, options.lightEmission)) / 15;
+		}
 		const material = new THREE.MeshStandardMaterial(materialOptions);
 
 		// Store atlas UV data in userData
@@ -1049,6 +1129,10 @@ export class AssetLoader {
 		}
 
 		// Cache and return the same instance (no cloning)
+		if (generation !== this.resourceGeneration) {
+			material.dispose();
+			return this.getMaterial(texturePath, options);
+		}
 		this.materialCache.set(cacheKey, material);
 		return material;
 	}
@@ -1181,10 +1265,96 @@ export class AssetLoader {
 		tex.anisotropy = 8; // clamped to the renderer's max at upload; kills grazing-angle arcs
 	}
 
+	private invalidateFluidFrames(): void {
+		const load = this.fluidFramesLoad;
+		this.fluidFramesLoad = null;
+		if (load) this.releaseFluidFrames(load);
+	}
+
+	private releaseFluidFrames(load: NonNullable<AssetLoader["fluidFramesLoad"]>): void {
+		for (const [key] of FLUID_TEXTURES) {
+			const texture = load.textures[key];
+			if (!texture) continue;
+			if (load.registry?.[key] === texture) load.registry[key] = null;
+			texture.dispose();
+		}
+		load.textures = {};
+	}
+
+	/** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
+	private loadFluidFrames(): Promise<void> {
+		if (this.fluidFramesLoad) {
+			const load = this.fluidFramesLoad;
+			return load.promise.then(() => {
+				// Other Cubane instances share the registry, but own their textures.
+				if (this.fluidFramesLoad === load && load.registry)
+					Object.assign(load.registry, load.textures);
+			});
+		}
+		const load: NonNullable<AssetLoader["fluidFramesLoad"]> = {
+			promise: Promise.resolve(),
+			textures: {},
+		};
+		this.fluidFramesLoad = load;
+		load.promise = (async () => {
+			const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
+			load.registry = liquidFrameTextures;
+			const entries = await Promise.all(
+				FLUID_TEXTURES.map(async ([key, path]) => {
+					let image: ImageBitmap | undefined;
+					let frames: THREE.DataArrayTexture | null = null;
+					try {
+						const blob = await this.getResourceBlob(`textures/block/${path}.png`);
+						if (!blob) return [key, null] as const;
+						image = await createImageBitmap(blob);
+						const canvas = document.createElement("canvas");
+						canvas.width = image.width;
+						canvas.height = image.height;
+						const context = canvas.getContext("2d", { willReadFrequently: true });
+						if (context) {
+							context.drawImage(image, 0, 0);
+							const pixels = context.getImageData(0, 0, image.width, image.height).data;
+							if (key.startsWith("water")) tintWaterPixels(pixels);
+							const metadata = await this.animatedTextureManager.loadAnimationMetadata(
+								`block/${path}`
+							);
+							frames = createFluidFrameTexture(
+								pixels,
+								image.width,
+								image.height,
+								metadata ?? undefined
+							);
+						}
+					} catch (error) {
+						console.warn(`Failed to load fluid texture block/${path}; using fallback:`, error);
+					} finally {
+						image?.close();
+					}
+					return [key, frames] as const;
+				})
+			);
+			load.textures = Object.fromEntries(entries);
+			// A pack switch or disposal can finish while the PNGs are decoding.
+			if (this.fluidFramesLoad !== load) {
+				this.releaseFluidFrames(load);
+				return;
+			}
+			Object.assign(liquidFrameTextures, load.textures);
+		})().catch((error) => {
+			if (this.fluidFramesLoad === load) this.fluidFramesLoad = null;
+			this.releaseFluidFrames(load);
+			throw error;
+		});
+		return load.promise;
+	}
+
 	public async buildTextureAtlas(): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Colormaps are independent of the atlas; load them before the early-return
 		// so biome tints are available even when the atlas is served from cache.
 		await this.loadColormaps();
+		await this.loadFluidFrames();
+		if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 
 		if (this.textureAtlas) return this.textureAtlas;
 
@@ -1198,6 +1368,7 @@ export class AssetLoader {
 					[],
 					`${this.resourcePackHash}:fmt${AssetLoader.ATLAS_FORMAT_VERSION}`
 				);
+				if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 				if (cacheResult.fromCache) {
 					console.log(
 						`🎯 Atlas loaded from cache with ${cacheResult.packingEfficiency.toFixed(
@@ -1338,11 +1509,9 @@ export class AssetLoader {
 						const blob = await this.getResourceBlob(`textures/${path}.png`);
 						if (!blob) return null;
 
-						// Keep the full animation strip in the atlas and harvest repeatable
-						// water frames for the surface shader. Preserve native color/alpha.
+						// Preserve lava's native pixels; only water needs a biome tint.
 						const image = await createImageBitmap(blob);
-						if (/^block\/(water|lava)_/.test(path)) {
-							const isWater = path.includes("water");
+						if (path.startsWith("block/water_")) {
 							const c = document.createElement("canvas");
 							c.width = image.width;
 							c.height = image.height;
@@ -1350,104 +1519,11 @@ export class AssetLoader {
 							if (!cx) return { path, image };
 							cx.drawImage(image, 0, 0);
 							const id = cx.getImageData(0, 0, c.width, c.height);
-							const d = id.data;
-							if (isWater) {
-								tintWaterPixels(d);
-								cx.putImageData(id, 0, 0);
-								const frames = createWaterFrameTexture(d, c.width, c.height);
-								const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
-								liquidFrameTextures[path.endsWith("_flow") ? "waterFlow" : "water"] = frames;
-								const tinted = await createImageBitmap(c);
-								image.close?.();
-								return { path, image: tinted };
-							}
-							let mono = true;
-							for (let i = 0; i < d.length; i += 4) {
-								if (Math.abs(d[i] - d[i + 1]) > 8 || Math.abs(d[i + 1] - d[i + 2]) > 8) {
-									mono = false;
-									break;
-								}
-							}
-							if (mono) {
-								// Keep the existing grayscale-lava normalization. Water was
-								// handled above with its original alpha and animation contrast.
-								const fw = image.width;
-								const t = [255, 255, 255];
-								const TARGET_L = 0.72 * 255;
-								const GLOBAL_A = 255;
-								for (let fy = 0; fy + fw <= c.height; fy += fw) {
-									let lsum = 0,
-										asum = 0,
-										n = 0;
-									for (let y = fy; y < fy + fw; y++) {
-										for (let x = 0; x < fw; x++) {
-											const i = (y * c.width + x) * 4;
-											lsum += d[i];
-											asum += d[i + 3];
-											n++;
-										}
-									}
-									const lNorm = Math.min(2.5, TARGET_L / Math.max(1, lsum / n));
-									const frameA = Math.max(1, asum / n);
-									for (let y = fy; y < fy + fw; y++) {
-										for (let x = 0; x < fw; x++) {
-											const i = (y * c.width + x) * 4;
-											const m = Math.min(255, d[i] * lNorm);
-											d[i] = (m * t[0]) / 255;
-											d[i + 1] = (m * t[1]) / 255;
-											d[i + 2] = (m * t[2]) / 255;
-											// keep some texture life but equalize frames
-											d[i + 3] = Math.max(0, Math.min(255, GLOBAL_A + (d[i + 3] - frameA) * 0.5));
-										}
-									}
-								}
-								cx.putImageData(id, 0, 0);
-								// HARVEST the processed still frames into a DataArrayTexture
-								// (fable): one array LAYER per animation frame with hardware
-								// RepeatWrapping — the record shader samples water by world
-								// coordinates with zero risk of atlas bleed/gutter/neighbours.
-								if (path === "block/lava_still") {
-									const frames = Math.floor(c.height / fw);
-									if (frames > 1) {
-										const layer = new Uint8Array(fw * fw * 4 * frames);
-										for (let f = 0; f < frames; f++) {
-											const fd = cx.getImageData(0, f * fw, fw, fw).data;
-											layer.set(fd, f * fw * fw * 4);
-										}
-										const arrTex = new THREE.DataArrayTexture(layer, fw, fw, frames);
-										arrTex.format = THREE.RGBAFormat;
-										arrTex.type = THREE.UnsignedByteType;
-										arrTex.wrapS = THREE.RepeatWrapping;
-										arrTex.wrapT = THREE.RepeatWrapping;
-										arrTex.magFilter = THREE.LinearFilter;
-										// full mip chain down to the 1x1 frame mean: the shader picks the
-										// level explicitly (textureLod, isotropic), so distance converges
-										// to a uniform sheet instead of a mip patchwork
-										arrTex.minFilter = THREE.LinearMipmapLinearFilter;
-										// NO anisotropy: the shader samples with explicit LOD (implicit-
-										// derivative texture() inside the water branch is undefined because
-										// the branch is on a varying). Anisotropic filtering on explicit-LOD
-										// taps is implementation-defined and was the view-direction-dependent
-										// mip blend; 1 makes every driver behave identically.
-										arrTex.anisotropy = 1;
-										arrTex.generateMipmaps = true;
-										// NO colorspace mark: the shared atlas texture is unmarked too —
-										// marking only this one sRGB made three decode+tonemap it twice
-										// and the water rendered near-black
-										arrTex.needsUpdate = true;
-										try {
-											// late import avoids a cubane -> meshing cycle at module load
-											const reg = await import("../meshing/RecordRenderer");
-											reg.liquidFrameTextures.lava = arrTex;
-										} catch {
-											/* registry unavailable — atlas strip path still works */
-										}
-									}
-								}
-								const tinted = await createImageBitmap(c);
-								image.close?.();
-								return { path, image: tinted };
-							}
+							tintWaterPixels(id.data);
+							cx.putImageData(id, 0, 0);
+							const tinted = await createImageBitmap(c);
+							image.close?.();
+							return { path, image: tinted };
 						}
 						return { path, image };
 					} catch (e) {
@@ -1479,12 +1555,8 @@ export class AssetLoader {
 		// invalidate at different moments, so a cached atlas can pair with geometry
 		// whose UVs were baked for a different layout (black tiles / flip-flopping
 		// chests+dust). A cold atlas build is ~2s once per session — cheap for coherence.
-		const cacheKey: string | undefined = undefined;
-
-		const { atlas, uvMap, packingEfficiency } = await atlasBuilder.buildAtlas(
-			textures,
-			`${cacheKey}:fmt${AssetLoader.ATLAS_FORMAT_VERSION}`
-		);
+		const { atlas, uvMap, packingEfficiency } = await atlasBuilder.buildAtlas(textures);
+		if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 
 		console.log(`✅ Atlas built with ${packingEfficiency.toFixed(1)}% efficiency`);
 		console.log(`📊 Packed ${uvMap.size} textures into ${atlas.width}x${atlas.height} atlas`);
@@ -1543,6 +1615,8 @@ export class AssetLoader {
 	 * Force rebuild atlas (ignores cache)
 	 */
 	public async rebuildTextureAtlas(): Promise<THREE.Texture> {
+		this.invalidateFluidFrames();
+		this.invalidateColormaps();
 		// Clear current atlas
 		this.textureAtlas = null;
 		this.textureUVMap.clear();
@@ -1677,6 +1751,9 @@ export class AssetLoader {
 	 * Clean up resources
 	 */
 	public dispose(): void {
+		this.invalidateFluidFrames();
+		this.invalidateColormaps();
+		this.tintManager.setColormaps(null, null, null);
 		// Dispose of all textures
 		this.textureCache.forEach((texture) => texture.dispose());
 		this.textureCache.clear();

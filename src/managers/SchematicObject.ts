@@ -36,6 +36,7 @@ import {
 } from "../meshing/SurfaceIndex";
 import { buildEndPortalMesh, makeEndPortalMaterial } from "../meshing/EndPortal";
 import { fluidPaletteStates } from "../meshing/FluidStateLookup";
+import { bakeStaticModelParts } from "../meshing/StaticModelParts";
 
 // Define chunk data interface to fix TypeScript errors
 
@@ -77,11 +78,11 @@ export class SchematicObject extends EventEmitter {
 			if (!mesh.visible || mesh.parent !== this.group) continue;
 			const material = mesh.material as THREE.ShaderMaterial;
 			if (material.opacity <= 0) continue;
-			const clip = material.uniforms.uLayerClip.value as THREE.Vector2;
-			if (clip.x > 0.5 && mesh.userData.minCellY > clip.y) continue;
+			const clip = material.uniforms.uLayerClip?.value as THREE.Vector2 | undefined;
+			if (clip && clip.x > 0.5 && mesh.userData.minCellY > clip.y) continue;
 			mesh.updateWorldMatrix(false, false);
 			this.surfaceViewBox.copy(mesh.geometry.boundingBox!);
-			if (clip.x > 0.5)
+			if (clip && clip.x > 0.5)
 				this.surfaceViewBox.max.y = Math.min(this.surfaceViewBox.max.y, Math.floor(clip.y) + 0.25);
 			this.surfaceViewBox.applyMatrix4(mesh.matrixWorld);
 			if (frustum.intersectsBox(this.surfaceViewBox)) return true;
@@ -1708,7 +1709,10 @@ export class SchematicObject extends EventEmitter {
 					return {};
 				}
 			};
-			const isChest2 = (b: string) => /^minecraft:(trapped_)?chest(\[|;|$)/.test(b);
+			const isChest2 = (b: string) =>
+				/^minecraft:(?:(?:trapped_|ender_)?chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest)(\[|;|$)/.test(
+					b
+				);
 			// CHESTS: per-cell template system (ChestModels.ts, approved design) —
 			// each cell renders its own (facing,type) half; no pairing/midpoint path
 			const chestSynth: Array<{
@@ -1717,7 +1721,14 @@ export class SchematicObject extends EventEmitter {
 				positions: Array<{ x: number; y: number; z: number }>;
 			}> = [];
 			const nonChestCells: typeof entityCells = [];
+			const special = new Map<string, typeof entityCells>();
 			for (const c of entityCells) {
+				if (/copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom/.test(c.block)) {
+					const cells = special.get(c.block);
+					if (cells) cells.push(c);
+					else special.set(c.block, [c]);
+					continue;
+				}
 				if (!isChest2(c.block)) {
 					nonChestCells.push(c);
 					continue;
@@ -1747,6 +1758,42 @@ export class SchematicObject extends EventEmitter {
 					console.warn("[ChestModels] chest render failed:", e);
 				}
 			}
+			// These templates already carry block-local transforms. Preserve their poses
+			// and per-element materials instead of recentering or applying facing twice.
+			const ownedSpecialMaterials = new Map<THREE.Material, THREE.Material>();
+			const ownSpecialMaterial = (source: THREE.Material): THREE.Material => {
+				let material = ownedSpecialMaterials.get(source);
+				if (!material) {
+					material = source.clone();
+					ownedSpecialMaterials.set(source, material);
+				}
+				return material;
+			};
+			for (const [state, cells] of special) {
+				const proto = await cubane.getBlockMesh(state, "plains", true);
+				for (const part of bakeStaticModelParts(proto)) {
+					const materialList = Array.isArray(part.material) ? part.material : [part.material];
+					if (materialList.some((m: THREE.Material) => m.userData.isWater)) {
+						part.geometry.dispose();
+						continue;
+					}
+					part.geometry.applyMatrix4(proto.matrix);
+					// Opacity changes and teardown belong to this schematic. Texture maps
+					// remain shared with the resource loader, while materials are owned here.
+					const material = Array.isArray(part.material)
+						? part.material.map(ownSpecialMaterial)
+						: ownSpecialMaterial(part.material);
+					const instances = new THREE.InstancedMesh(part.geometry, material, cells.length);
+					const matrix = new THREE.Matrix4();
+					cells.forEach((cell, i) =>
+						instances.setMatrixAt(i, matrix.makeTranslation(cell.x, cell.y, cell.z))
+					);
+					instances.instanceMatrix.needsUpdate = true;
+					instances.computeBoundingSphere();
+					meshes.push(instances);
+				}
+			}
+
 			const byPos = new Map<string, any>();
 			for (const c of nonChestCells) if (isChest2(c.block)) byPos.set(`${c.x},${c.y},${c.z}`, c);
 			const consumed2 = new Set<string>();
@@ -2275,7 +2322,7 @@ export class SchematicObject extends EventEmitter {
 		// water renderer on raw un-normalized strip textures made bypass patches
 		// adjacent to record patches visibly darker ("water changes color")
 		const ENTITY_FAMILY =
-			/minecraft:(trapped_chest|ender_chest|chest|redstone_wire|kelp|kelp_plant|seagrass|tall_seagrass)(\[|\s|$)/;
+			/minecraft:(trapped_chest|ender_chest|chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom|redstone_wire|kelp|kelp_plant|seagrass|tall_seagrass)(\[|\s|$)/;
 		const entityPalette = new Set<number>();
 		(palettes.default || []).forEach((e: any, i: number) => {
 			if (ENTITY_FAMILY.test(e?.name || e?.Name || "")) entityPalette.add(i);
@@ -2528,7 +2575,8 @@ export class SchematicObject extends EventEmitter {
 
 		// Initialize instanced rendering
 		await this.worldMeshBuilder.precomputePaletteGeometries(
-			this.getPalettes(this.schematicWrapper).default
+			this.getPalettes(this.schematicWrapper).default,
+			true
 		);
 
 		this.worldMeshBuilder.enableInstancedRendering(this.group, true);
@@ -2540,6 +2588,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Return instanced meshes from scene graph
 		const instancedMeshes = Array.from(this.group.children);
+		instancedMeshes.push(...(await this.buildFluidSurface(schematicObject)));
 
 		// Dispatch completion event
 		if (typeof window !== "undefined") {
