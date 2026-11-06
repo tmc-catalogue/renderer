@@ -32,6 +32,7 @@ export class AssetLoader {
 	private modelCache: Map<string, BlockModel> = new Map();
 	private textureCache: Map<string, THREE.Texture> = new Map();
 	private materialCache: Map<string, THREE.Material> = new Map();
+	private resourceGeneration = 0;
 	private fluidFramesLoad: {
 		promise: Promise<void>;
 		textures: FluidTextures;
@@ -63,9 +64,7 @@ export class AssetLoader {
 	 * Connect to a ResourcePackManager for managed pack loading
 	 */
 	public setPackManager(manager: ResourcePackManager): void {
-		this.invalidateFluidFrames();
-		this.invalidateColormaps();
-		this.stringCache.clear();
+		this.invalidatePackAssets();
 		this.packManager = manager;
 		this.usePackManager = true;
 
@@ -80,6 +79,23 @@ export class AssetLoader {
 	 */
 	private async rebuildFromPackManager(): Promise<void> {
 		if (!this.packManager) return;
+		this.invalidatePackAssets();
+
+		// Recalculate hash from enabled packs for cache key
+		const generation = this.resourceGeneration;
+		const enabledPacks = this.packManager.getEnabledPacks();
+		const packHashes = enabledPacks.map((p) => p.hash);
+		const hash = await this.hashString(packHashes.join(":"));
+		if (generation !== this.resourceGeneration) return;
+		this.resourcePackHash = hash;
+
+		await this.buildTextureAtlas();
+	}
+
+	/** Release all assets derived from the previous pack stack. */
+	private invalidatePackAssets(): void {
+		this.resourceGeneration++;
+		this.resourcePackHash = "";
 		this.invalidateFluidFrames();
 
 		// Clear caches that depend on pack content
@@ -87,7 +103,11 @@ export class AssetLoader {
 		this.blockStateCache.clear();
 		this.modelCache.clear();
 
-		this.textureCache.forEach((t) => t.dispose());
+		const textures = new Set([
+			...this.textureCache.values(),
+			...this.animatedTextureManager.clear(),
+		]);
+		textures.forEach((t) => t.dispose());
 		this.textureCache.clear();
 
 		this.materialCache.forEach((m) => m.dispose());
@@ -101,14 +121,6 @@ export class AssetLoader {
 			this.textureAtlas = null;
 		}
 		this.textureUVMap.clear();
-
-		// Recalculate hash from enabled packs for cache key
-		const enabledPacks = this.packManager.getEnabledPacks();
-		const packHashes = enabledPacks.map((p) => p.hash);
-		this.resourcePackHash = await this.hashString(packHashes.join(":"));
-
-		// Rebuild atlas
-		await this.buildTextureAtlas();
 	}
 
 	/**
@@ -157,18 +169,16 @@ export class AssetLoader {
 	 * Load a resource pack from a blob
 	 */
 	public async loadResourcePack(blob: Blob): Promise<void> {
+		if (this.usePackManager && this.packManager) {
+			await this.packManager.loadPackFromBlob(blob);
+			return;
+		}
 		try {
 			console.log("🔍 Loading resource pack from blob...");
 
 			// Ensure fully loaded and safe Blob
 			const arrayBuffer = await blob.arrayBuffer();
 			console.log("📦 Blob size:", arrayBuffer.byteLength, "type:", blob.type);
-
-			// Calculate hash for caching
-			if (this.cacheEnabled) {
-				this.resourcePackHash = await this.calculateResourcePackHash(arrayBuffer);
-				console.log("🔑 Resource pack hash:", this.resourcePackHash.substring(0, 16) + "...");
-			}
 
 			// Optional: Verify ZIP signature at start
 			const header = new Uint8Array(arrayBuffer.slice(0, 4));
@@ -200,12 +210,18 @@ export class AssetLoader {
 			console.log("📁 textures:", textures.length);
 
 			// Register pack
-			const packId = `pack_${Date.now()}`;
+			// Include the fallback stack in the key; the same override can produce
+			// different atlases over different base packs. Failed loads leave it intact.
+			const hash = this.cacheEnabled
+				? await this.hashString(
+						`${this.resourcePackHash}:${await this.calculateResourcePackHash(arrayBuffer)}`
+					)
+				: "";
+			const packId = `pack_${this.resourceGeneration}`;
 			this.resourcePacks.set(packId, zip);
 			this.resourcePackOrder.unshift(packId);
-			this.stringCache.clear();
-			this.invalidateFluidFrames();
-			this.invalidateColormaps();
+			this.invalidatePackAssets();
+			this.resourcePackHash = hash;
 		} catch (error) {
 			console.error("❌ Failed to load resource pack:", error);
 			throw error;
@@ -235,6 +251,7 @@ export class AssetLoader {
 		path: string,
 		silent: boolean = true
 	): Promise<string | undefined> {
+		const generation = this.resourceGeneration;
 		// Check cache first
 		const cacheKey = `string:${path}`;
 		if (this.stringCache.has(cacheKey)) {
@@ -247,6 +264,7 @@ export class AssetLoader {
 			if (file) {
 				try {
 					const content = await file.async("string");
+					if (generation !== this.resourceGeneration) return this.getResourceString(path, silent);
 					this.stringCache.set(cacheKey, content);
 					return content;
 				} catch (error) {
@@ -287,6 +305,7 @@ export class AssetLoader {
 	 * Get a block state definition
 	 */
 	public async getBlockState(blockId: string): Promise<BlockStateDefinition> {
+		const generation = this.resourceGeneration;
 		// Remove minecraft: prefix if present
 		blockId = blockId.replace("minecraft:", "");
 
@@ -304,6 +323,7 @@ export class AssetLoader {
 			const alias = blockId === "iron_chain" ? "chain" : "iron_chain";
 			jsonString = await this.getResourceString(`blockstates/${alias}.json`);
 		}
+		if (generation !== this.resourceGeneration) return this.getBlockState(blockId);
 		if (!jsonString) {
 			console.warn(`Block state definition for ${blockId} not found.`);
 			return {} as BlockStateDefinition;
@@ -320,6 +340,7 @@ export class AssetLoader {
 	}
 
 	public async getModel(modelPath: string): Promise<BlockModel> {
+		const generation = this.resourceGeneration;
 		// Remove minecraft: prefix if present
 		modelPath = modelPath.replace("minecraft:", "");
 
@@ -407,12 +428,14 @@ export class AssetLoader {
 			}
 
 			// Cache and return the enhanced model
+			if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 			this.modelCache.set(cacheKey, liquidModel);
 			return liquidModel;
 		}
 
 		// For non-liquid models, load from resource pack
 		const jsonString = await this.getResourceString(`models/${modelPath}.json`);
+		if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 		if (!jsonString) {
 			console.warn(`Model definition for ${modelPath} not found.`);
 			return {} as BlockModel;
@@ -425,6 +448,7 @@ export class AssetLoader {
 			// If the model has a parent, we need to merge with it
 			if (model.parent) {
 				const mergedModel = await this.loadAndMergeModel(model);
+				if (generation !== this.resourceGeneration) return this.getModel(modelPath);
 				this.modelCache.set(cacheKey, mergedModel);
 				return mergedModel;
 			}
@@ -548,6 +572,7 @@ export class AssetLoader {
 	}
 
 	public async getTexture(texturePath: string): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Handle missing texture path
 		if (
 			!texturePath ||
@@ -566,9 +591,11 @@ export class AssetLoader {
 
 		// Check for animation
 		const isAnimated = await this.animatedTextureManager.isAnimated(`textures/${texturePath}`);
+		if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 
 		if (isAnimated) {
 			const animatedTexture = await this.animatedTextureManager.createAnimatedTexture(texturePath);
+			if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 			if (animatedTexture) {
 				console.log(`Successfully created animated texture for ${texturePath}`);
 				this.textureCache.set(cacheKey, animatedTexture);
@@ -585,6 +612,7 @@ export class AssetLoader {
 
 		// Load texture blob from resource pack
 		const blob = await this.getResourceBlob(`textures/${fullPath}`);
+		if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 		if (!blob) {
 			console.warn(`Texture blob not found for ${texturePath}`);
 
@@ -593,9 +621,10 @@ export class AssetLoader {
 				// Try without the "block/" prefix
 				const altPath = texturePath.replace("block/", "");
 				const altBlob = await this.getResourceBlob(`textures/${altPath}.png`);
+				if (generation !== this.resourceGeneration) return this.getTexture(texturePath);
 				if (altBlob) {
 					// Continue with this blob
-					return this.createTextureFromBlob(altBlob, cacheKey);
+					return this.createTextureFromBlob(altBlob, cacheKey, texturePath);
 				}
 			}
 
@@ -612,6 +641,7 @@ export class AssetLoader {
 		cacheKey: string,
 		texturePath: string = ""
 	): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Convert blob to data URL
 		const url = URL.createObjectURL(blob);
 
@@ -639,6 +669,10 @@ export class AssetLoader {
 				);
 			});
 
+			if (generation !== this.resourceGeneration) {
+				texture.dispose();
+				return this.getTexture(texturePath);
+			}
 			this.textureCache.set(cacheKey, texture);
 
 			return texture;
@@ -884,6 +918,7 @@ export class AssetLoader {
 			useAtlas?: boolean;
 		} = {}
 	): Promise<THREE.Material> {
+		const generation = this.resourceGeneration;
 		const useAtlas = options.useAtlas ?? true;
 
 		// Create cache key
@@ -1094,6 +1129,10 @@ export class AssetLoader {
 		}
 
 		// Cache and return the same instance (no cloning)
+		if (generation !== this.resourceGeneration) {
+			material.dispose();
+			return this.getMaterial(texturePath, options);
+		}
 		this.materialCache.set(cacheKey, material);
 		return material;
 	}
@@ -1310,10 +1349,12 @@ export class AssetLoader {
 	}
 
 	public async buildTextureAtlas(): Promise<THREE.Texture> {
+		const generation = this.resourceGeneration;
 		// Colormaps are independent of the atlas; load them before the early-return
 		// so biome tints are available even when the atlas is served from cache.
 		await this.loadColormaps();
 		await this.loadFluidFrames();
+		if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 
 		if (this.textureAtlas) return this.textureAtlas;
 
@@ -1327,6 +1368,7 @@ export class AssetLoader {
 					[],
 					`${this.resourcePackHash}:fmt${AssetLoader.ATLAS_FORMAT_VERSION}`
 				);
+				if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 				if (cacheResult.fromCache) {
 					console.log(
 						`🎯 Atlas loaded from cache with ${cacheResult.packingEfficiency.toFixed(
@@ -1513,12 +1555,8 @@ export class AssetLoader {
 		// invalidate at different moments, so a cached atlas can pair with geometry
 		// whose UVs were baked for a different layout (black tiles / flip-flopping
 		// chests+dust). A cold atlas build is ~2s once per session — cheap for coherence.
-		const cacheKey: string | undefined = undefined;
-
-		const { atlas, uvMap, packingEfficiency } = await atlasBuilder.buildAtlas(
-			textures,
-			`${cacheKey}:fmt${AssetLoader.ATLAS_FORMAT_VERSION}`
-		);
+		const { atlas, uvMap, packingEfficiency } = await atlasBuilder.buildAtlas(textures);
+		if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 
 		console.log(`✅ Atlas built with ${packingEfficiency.toFixed(1)}% efficiency`);
 		console.log(`📊 Packed ${uvMap.size} textures into ${atlas.width}x${atlas.height} atlas`);

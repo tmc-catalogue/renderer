@@ -2,11 +2,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import JSZip from "jszip";
 import { AssetLoader } from "./AssetLoader";
+import { AtlasBuilder } from "./AtlasBuilder";
 import { InstancedBlockRenderer } from "../InstancedBlockRenderer";
 import { liquidFrameTextures } from "../meshing/RecordRenderer";
 import { createFluidMaterial, setFluidTextures, updateFluidTime } from "../meshing/WaterMesher";
 import { fluidAnimationFrame } from "../meshing/FluidAnimation";
 import type { ResourcePackManager } from "./ResourcePackManager";
+
+// Pack switches now discard the old atlas. Keep these fluid-focused tests
+// independent of canvas packing while allowing a replacement atlas to be built.
+function mockAtlasRebuild(loader: AssetLoader): void {
+	vi.spyOn(loader as any, "configureAtlasMips").mockImplementation(() => {});
+	vi.spyOn(AtlasBuilder.prototype, "buildAtlas").mockResolvedValue({
+		atlas: document.createElement("canvas"),
+		uvMap: new Map(),
+		packingEfficiency: 100,
+		fromCache: false,
+	});
+}
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -23,6 +36,7 @@ describe("lava rendering", () => {
 		"loads colored lava with %i frames even when the atlas is cached",
 		async (frames) => {
 			const loader = new AssetLoader(false);
+			mockAtlasRebuild(loader);
 			const atlas = new THREE.Texture();
 			// Exercise the atlas cache-hit path without a browser's canvas/PNG decoder.
 			(loader as any).textureAtlas = atlas;
@@ -183,6 +197,7 @@ describe("lava rendering", () => {
 		"reloads animation metadata when a %s pack replaces cached fluid frames",
 		async (source) => {
 			const loader = new AssetLoader(false);
+			mockAtlasRebuild(loader);
 			(loader as any).textureAtlas = new THREE.Texture();
 			vi.spyOn(loader as any, "loadColormaps").mockResolvedValue(undefined);
 			vi.spyOn(loader, "getResourceBlob").mockImplementation(async (path) =>

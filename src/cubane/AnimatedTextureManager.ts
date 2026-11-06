@@ -20,12 +20,23 @@ export class AnimatedTextureManager {
 			lastFrameTime: number;
 		}
 	> = new Map();
+	private generation = 0;
+	private pendingImages = new Set<() => void>();
 
 	constructor(private assetLoader: AssetLoader) {}
 
 	/** True when at least one animated texture is registered (drives continuous rendering). */
 	public hasActiveTextures(): boolean {
 		return this.animatedTextures.size > 0;
+	}
+
+	/** Stop old animations and return their textures to the owner's disposal pass. */
+	public clear(): THREE.Texture[] {
+		this.generation++;
+		const textures = [...this.animatedTextures.values()].map(({ texture }) => texture);
+		this.animatedTextures.clear();
+		for (const cancel of this.pendingImages) cancel();
+		return textures;
 	}
 
 	/**
@@ -63,6 +74,7 @@ export class AnimatedTextureManager {
 	 * Create an animated texture
 	 */
 	public async createAnimatedTexture(texturePath: string): Promise<THREE.Texture | null> {
+		const generation = this.generation;
 		// Reuse an already-registered animated texture. Without this, a block whose
 		// faces share one texture (e.g. kelp's 4 cross faces) creates a new texture
 		// per face, but only the last one is tracked in `animatedTextures` and gets
@@ -74,14 +86,22 @@ export class AnimatedTextureManager {
 		}
 
 		// Load the metadata
-		const metadata = await this.loadAnimationMetadata(texturePath);
-		if (!metadata) {
+		const metadata = await this.loadAnimationMetadata(texturePath).catch((error) => {
+			if (generation !== this.generation) return null;
+			throw error;
+		});
+		if (!metadata || generation !== this.generation) {
 			return null;
 		}
 
 		// Load the texture image
-		const textureBlob = await this.assetLoader.getResourceBlob(`textures/${texturePath}.png`);
-		if (!textureBlob) {
+		const textureBlob = await this.assetLoader
+			.getResourceBlob(`textures/${texturePath}.png`)
+			.catch((error) => {
+				if (generation !== this.generation) return null;
+				throw error;
+			});
+		if (!textureBlob || generation !== this.generation) {
 			return null;
 		}
 
@@ -90,8 +110,23 @@ export class AnimatedTextureManager {
 		const objectUrl = URL.createObjectURL(textureBlob);
 
 		return new Promise<THREE.Texture | null>((resolve) => {
-			image.onload = () => {
+			let settled = false;
+			const finish = (texture: THREE.Texture | null) => {
+				if (settled) return;
+				settled = true;
+				this.pendingImages.delete(cancel);
+				image.onload = null;
+				image.onerror = null;
 				URL.revokeObjectURL(objectUrl);
+				resolve(texture);
+			};
+			const cancel = () => finish(null);
+			this.pendingImages.add(cancel);
+			image.onload = () => {
+				if (settled || generation !== this.generation) {
+					finish(null);
+					return;
+				}
 
 				// Calculate frame count based on image dimensions
 				// Typically, animated textures in Minecraft have frames stacked vertically
@@ -131,13 +166,10 @@ export class AnimatedTextureManager {
 					lastFrameTime: Date.now(),
 				});
 
-				resolve(texture);
+				finish(texture);
 			};
 
-			image.onerror = () => {
-				URL.revokeObjectURL(objectUrl);
-				resolve(null);
-			};
+			image.onerror = cancel;
 
 			image.src = objectUrl;
 		});
