@@ -738,7 +738,8 @@ export class Cubane {
 
 		if (useCache && this.blockMeshCache.has(cacheKey)) {
 			const cachedMesh = this.blockMeshCache.get(cacheKey)!;
-			return cachedMesh.clone(); // Return a clone for safety
+			// Clone the hierarchy; geometry and materials remain shared template resources.
+			return cachedMesh.clone();
 		}
 
 		const block = this.parseBlockString(blockString);

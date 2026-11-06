@@ -1760,6 +1760,15 @@ export class SchematicObject extends EventEmitter {
 			}
 			// These templates already carry block-local transforms. Preserve their poses
 			// and per-element materials instead of recentering or applying facing twice.
+			const ownedSpecialMaterials = new Map<THREE.Material, THREE.Material>();
+			const ownSpecialMaterial = (source: THREE.Material): THREE.Material => {
+				let material = ownedSpecialMaterials.get(source);
+				if (!material) {
+					material = source.clone();
+					ownedSpecialMaterials.set(source, material);
+				}
+				return material;
+			};
 			for (const [state, cells] of special) {
 				const proto = await cubane.getBlockMesh(state, "plains", true);
 				for (const part of bakeStaticModelParts(proto)) {
@@ -1769,7 +1778,12 @@ export class SchematicObject extends EventEmitter {
 						continue;
 					}
 					part.geometry.applyMatrix4(proto.matrix);
-					const instances = new THREE.InstancedMesh(part.geometry, part.material, cells.length);
+					// Opacity changes and teardown belong to this schematic. Texture maps
+					// remain shared with the resource loader, while materials are owned here.
+					const material = Array.isArray(part.material)
+						? part.material.map(ownSpecialMaterial)
+						: ownSpecialMaterial(part.material);
+					const instances = new THREE.InstancedMesh(part.geometry, material, cells.length);
 					const matrix = new THREE.Matrix4();
 					cells.forEach((cell, i) =>
 						instances.setMatrixAt(i, matrix.makeTranslation(cell.x, cell.y, cell.z))
