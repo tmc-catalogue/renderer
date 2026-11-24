@@ -16,12 +16,19 @@ vi.mock("./workers/MeshBuilderWasm.worker?worker&inline", () => ({ default: clas
 import { WorldMeshBuilder } from "./WorldMeshBuilder";
 import { MaterialRegistry } from "./MaterialRegistry";
 import { buildChestBlockMesh } from "./meshing/ChestModels";
+import { AssetLoader } from "./cubane/AssetLoader";
 
 interface PaletteDescriptor {
 	index: number;
 	category: keyof ChunkMeshes;
 	occlusionFlags: number;
-	geometries: Array<{ positions: Float32Array; fluid?: "water" | "lava" }>;
+	fluid?: "water" | "lava";
+	geometries: Array<{
+		positions: Float32Array;
+		indices: Uint16Array | Uint32Array;
+		category: keyof ChunkMeshes;
+		fluid?: "water" | "lava";
+	}>;
 }
 
 const builders: WorldMeshBuilder[] = [];
@@ -94,6 +101,50 @@ afterEach(() => {
 });
 
 describe("palette mesh extraction", () => {
+	it("routes opaque obsidian to the solid pass even when its atlas contains alpha tiles", async () => {
+		const loader = new AssetLoader(false);
+		const atlas = document.createElement("canvas");
+		atlas.width = 3;
+		atlas.height = 1;
+		const texture = new THREE.CanvasTexture(atlas);
+		const readPixels = vi.fn((x: number) => ({
+			data: new Uint8ClampedArray([20, 30, 40, [255, 0, 128][x]]),
+		}));
+		vi.spyOn(atlas, "getContext").mockReturnValue({ getImageData: readPixels } as any);
+		const names = ["obsidian", "custom_cutout", "custom_blend"];
+		Object.assign(loader, {
+			textureAtlas: texture,
+			textureUVMap: new Map(
+				names.map((name, i) => [`block/${name}`, { u: i / 3, v: 0, width: 1 / 3, height: 1 }])
+			),
+		});
+		const builder = createBuilder(async (state) => {
+			const material = await loader.getMaterial(`block/${state.replace("minecraft:", "")}`);
+			const mesh = new THREE.Mesh(new THREE.BoxGeometry(), material);
+			models.push(mesh);
+			return mesh;
+		});
+		try {
+			await builder.precomputePaletteGeometries(
+				names.map((name) => ({ name: `minecraft:${name}` })),
+				true
+			);
+			const palette = paletteSentToWorker()
+				.slice()
+				.sort((a, b) => a.index - b.index);
+			expect(palette.map((block) => block.category)).toEqual(["solid", "cutout", "transparent"]);
+			expect(await loader.getMaterial("block/obsidian", { faceDirection: "north" })).toMatchObject({
+				transparent: false,
+				alphaTest: 0,
+				depthWrite: true,
+			});
+			expect(readPixels).toHaveBeenCalledTimes(3);
+			expect(readPixels).toHaveBeenCalledWith(0, 0, 1, 1);
+		} finally {
+			loader.dispose();
+		}
+	});
+
 	it.each([
 		"glass",
 		"white_stained_glass",
@@ -112,8 +163,8 @@ describe("palette mesh extraction", () => {
 
 	it.each([
 		{ name: "polished_andesite_stairs", material: {}, category: "solid" },
-		{ name: "scaffolding", material: { alphaTest: 0.5 }, category: "transparent" },
-		{ name: "kelp", material: { alphaTest: 0.5 }, category: "transparent" },
+		{ name: "scaffolding", material: { alphaTest: 0.5 }, category: "cutout" },
+		{ name: "kelp", material: { alphaTest: 0.5 }, category: "cutout" },
 		{ name: "custom_host", material: { transparent: true, opacity: 0.5 }, category: "transparent" },
 	])(
 		"classifies the retained $name host from its own material",
@@ -126,7 +177,7 @@ describe("palette mesh extraction", () => {
 			);
 			const palette = paletteSentToWorker();
 			expect(palette).toHaveLength(1);
-			expect(palette[0]).toMatchObject({ category, occlusionFlags: 0 });
+			expect(palette[0]).toMatchObject({ category, occlusionFlags: category === "solid" ? 63 : 0 });
 			expect(palette[0].geometries).toHaveLength(1);
 			expect(palette[0].geometries[0].fluid).toBeUndefined();
 			expect(palette[0].geometries[0].positions).toEqual(host.geometry.attributes.position.array);
@@ -149,27 +200,94 @@ describe("palette mesh extraction", () => {
 	it.each([
 		{ name: "polished_andesite_stairs", properties: { waterlogged: "true" } },
 		{ name: "kelp", properties: {} },
-	])("keeps $name and its water in the water pass in legacy mode", async (state) => {
+	])("keeps $name and its water in their own passes in legacy mode", async (state) => {
 		const builder = createBuilder(async () => withFluid(box()));
 		await builder.precomputePaletteGeometries([{ ...state, name: "minecraft:" + state.name }]);
 		const palette = paletteSentToWorker();
 		expect(palette).toHaveLength(1);
-		expect(palette[0]).toMatchObject({ category: "water", occlusionFlags: 63 });
+		expect(palette[0]).toMatchObject({ category: "solid", occlusionFlags: 63 });
+		expect(palette[0].geometries.map((g) => g.category)).toEqual(["solid", "water"]);
 		expect(palette[0].geometries.map((geometry) => geometry.fluid)).toEqual([undefined, "water"]);
 	});
 
 	it.each(["water", "lava"] as const)(
-		"keeps standalone %s in the water category",
+		"preserves standalone %s material category and fluid identity",
 		async (fluid) => {
-			const mesh = box({ transparent: true });
+			const mesh = box({ transparent: fluid === "water" });
 			mesh.material.userData[fluid === "water" ? "isWater" : "isLava"] = true;
 			const builder = createBuilder(async () => mesh);
 			await builder.precomputePaletteGeometries([{ name: "minecraft:" + fluid }]);
 			expect(paletteSentToWorker()).toMatchObject([
-				{ category: "water", occlusionFlags: 63, geometries: [{ fluid }] },
+				{
+					category: fluid === "water" ? "water" : "solid",
+					fluid,
+					occlusionFlags: fluid === "water" ? 0 : 63,
+					geometries: [{ fluid }],
+				},
 			]);
 		}
 	);
+
+	it("does not force similarly named opaque blocks into translucent or water passes", async () => {
+		const names = [
+			"packed_ice",
+			"blue_ice",
+			"water_cauldron",
+			"lava_cauldron",
+			"custom_glass_solid",
+		];
+		const builder = createBuilder(async () => box());
+		await builder.precomputePaletteGeometries(names.map((name) => ({ name: `minecraft:${name}` })));
+		expect(
+			paletteSentToWorker().every(
+				(block) => block.category === "solid" && block.occlusionFlags === 63
+			)
+		).toBe(true);
+	});
+
+	it("compares every palette entry and snapshots in-place state mutations", async () => {
+		const getMesh = vi.fn(async () => box());
+		const builder = createBuilder(getMesh);
+		const palette = [
+			{ name: "minecraft:air" },
+			{ name: "minecraft:stone", properties: { variant: "a" } },
+			{ name: "minecraft:glass" },
+		];
+		await builder.precomputePaletteGeometries(palette);
+		expect(getMesh).toHaveBeenCalledTimes(3);
+		await builder.precomputePaletteGeometries(palette);
+		expect(getMesh).toHaveBeenCalledTimes(3);
+		palette[1].name = "minecraft:obsidian";
+		await builder.precomputePaletteGeometries(palette);
+		expect(getMesh).toHaveBeenCalledTimes(6);
+		palette[1].properties!.variant = "b";
+		await builder.precomputePaletteGeometries(palette);
+		expect(getMesh).toHaveBeenCalledTimes(9);
+	});
+
+	it("keeps grouped opaque and cutout faces separate and only occludes actual opaque boundary faces", async () => {
+		const opaque = new THREE.MeshBasicMaterial();
+		const cutout = new THREE.MeshBasicMaterial({ alphaTest: 0.5 });
+		const mesh = new THREE.Mesh(new THREE.BoxGeometry(), [
+			opaque,
+			cutout,
+			opaque,
+			opaque,
+			opaque,
+			opaque,
+		]);
+		models.push(mesh);
+		const builder = createBuilder(async () => mesh);
+		await builder.precomputePaletteGeometries([{ name: "minecraft:mixed" }]);
+		const [block] = paletteSentToWorker();
+		expect(block.geometries).toHaveLength(6);
+		expect(block.geometries.filter((g) => g.category === "cutout")).toHaveLength(1);
+		expect(block.geometries.every((g) => g.indices.length === 6 && g.positions.length === 12)).toBe(
+			true
+		);
+		// Box group 1 is -X (west); its alpha holes cannot occlude.
+		expect(block.occlusionFlags).toBe(62);
+	});
 
 	it.each([false, true])(
 		"keeps same-name block states independent (transparent state first: %s)",

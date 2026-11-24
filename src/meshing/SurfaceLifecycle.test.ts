@@ -110,6 +110,128 @@ const triangles = (meshes: THREE.Mesh[]) =>
 	);
 
 describe("surface edit lifecycle", () => {
+	it("does not let concurrent schematics replace a shared builder palette mid-build", async () => {
+		const first = buildableSchematic(),
+			second = buildableSchematic();
+		second.object.worldMeshBuilder = first.object.worldMeshBuilder;
+		let release!: () => void, started!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const building = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		first.mainBuild.mockImplementationOnce(async () => {
+			started();
+			await gate;
+			return { meshes: [], chunkMap: new Map() };
+		});
+		first.object.meshesReady = first.object.buildMeshes();
+		await building;
+		second.object.meshesReady = second.object.buildMeshes();
+		await Promise.resolve();
+		expect(second.mainBuild).not.toHaveBeenCalled();
+		release();
+		await Promise.all([first.object.meshesReady, second.object.meshesReady]);
+		expect(second.mainBuild).toHaveBeenCalledOnce();
+	});
+	it("builds a schematic initially loaded hidden exactly once when shown", async () => {
+		const { object, mainBuild } = buildableSchematic();
+		object.visible = false;
+		object.hasBuiltMeshes = false;
+		object.meshesReady = object.buildMeshes();
+		await object.meshesReady;
+		expect(mainBuild).not.toHaveBeenCalled();
+		object.visible = true;
+		object.updateMeshVisibility();
+		object.updateMeshVisibility();
+		await object.editQueue;
+		expect(mainBuild).toHaveBeenCalledOnce();
+		expect(object.meshes).toHaveLength(1);
+		expect(object.group.visible).toBe(true);
+	});
+
+	it("disposal cancels progressive GPU staging and releases even unattached records", async () => {
+		const { object } = buildableSchematic();
+		const records = Array.from({ length: 7 }, () => {
+			const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMaterial());
+			mesh.userData.gpuBuilt = true;
+			mesh.userData.releaseRecordResources = vi.fn();
+			return mesh;
+		});
+		const releases = records.map((mesh) => mesh.userData.releaseRecordResources);
+		vi.spyOn(object, "buildSchematicMeshes").mockResolvedValue({
+			meshes: records,
+			chunkMap: new Map(),
+		});
+		let started!: () => void;
+		const firstDraw = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		object.schematicRenderer.renderManager = { render: () => started() };
+		let time = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => (time += 10));
+		try {
+			object.meshesReady = object.buildMeshes();
+			await firstDraw;
+			await object.dispose();
+			expect(object.group.children).toHaveLength(0);
+			expect(object.meshes).toHaveLength(0);
+			for (const release of releases) expect(release).toHaveBeenCalledOnce();
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it("isolates a shared palette material before fading one schematic", () => {
+		const first = schematic().object,
+			second = schematic().object;
+		const shared = new THREE.MeshStandardMaterial({
+			transparent: true,
+			opacity: 0.6,
+			depthWrite: false,
+		});
+		shared.userData.registryShared = true;
+		const meshes = [
+			new THREE.Mesh(new THREE.BoxGeometry(), shared),
+			new THREE.Mesh(new THREE.BoxGeometry(), shared),
+		];
+		first.applyPropertiesToObjects([meshes[0]]);
+		second.applyPropertiesToObjects([meshes[1]]);
+		first.group.add(meshes[0]);
+		second.group.add(meshes[1]);
+		first.opacity = 0.2;
+		first.updateMeshMaterials("opacity");
+		expect(meshes[0].material.opacity).toBeCloseTo(0.12);
+		expect(meshes[1].material.opacity).toBe(0.6);
+		expect(shared.opacity).toBe(0.6);
+		first.opacity = 1;
+		first.updateMeshMaterials("opacity");
+		expect(meshes[0].material).toMatchObject({
+			transparent: true,
+			depthWrite: false,
+			opacity: 0.6,
+		});
+	});
+
+	it("refreshes adjoining water geometry when a glass-only edit changes its overlay face", async () => {
+		const { object, cells } = schematic();
+		cells.set("1,0,0", "minecraft:water");
+		const old = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial());
+		old.userData.fluidMesh = true;
+		const replacement = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial());
+		replacement.userData.fluidMesh = true;
+		object.meshes.push(old);
+		object.group.add(old);
+		const dispose = vi.spyOn(old.geometry, "dispose");
+		object.buildFluidSurface = vi.fn(async () => [replacement]);
+		await object.setBlock([0, 0, 0], "minecraft:glass");
+		expect(object.buildFluidSurface).toHaveBeenCalledOnce();
+		expect(object.meshes).toContain(replacement);
+		expect(object.meshes).not.toContain(old);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(object.rebuildMeshNow).not.toHaveBeenCalled();
+	});
 	it("keeps the main mesh after a surface failure and rebuilds surfaces on retry", async () => {
 		const { object, loader, cells } = buildableSchematic();
 		cells.set("0,0,0", "minecraft:end_portal");

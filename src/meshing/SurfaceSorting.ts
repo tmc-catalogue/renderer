@@ -1,7 +1,11 @@
 import * as THREE from "three";
 
 /** Stable linear-time depth sorting. Unchanged order never dirties the GPU buffer. */
-export function installSurfaceSorting(mesh: THREE.Mesh, centers: Float32Array): void {
+export function installSurfaceSorting(
+	mesh: THREE.Mesh,
+	centers: Float32Array,
+	onlyWhenTransparent = false
+): void {
 	const index = mesh.geometry.index!;
 	const base = index.array.slice();
 	const count = centers.length / 3;
@@ -12,11 +16,14 @@ export function installSurfaceSorting(mesh: THREE.Mesh, centers: Float32Array): 
 	const keys = new Uint32Array(count);
 	const buckets = new Uint32Array(256);
 	const view = new THREE.Matrix4();
+	const previous = mesh.onBeforeRender;
 	let lastX = NaN,
 		lastY = NaN,
 		lastZ = NaN;
 	index.setUsage(THREE.DynamicDrawUsage);
-	mesh.onBeforeRender = (_renderer, _scene, camera) => {
+	mesh.onBeforeRender = (renderer, scene, camera, geometry, material, group) => {
+		previous.call(mesh, renderer, scene, camera, geometry, material, group);
+		if (onlyWhenTransparent && !material.transparent) return;
 		view.multiplyMatrices(camera.matrixWorldInverse, mesh.matrixWorld);
 		const e = view.elements,
 			x = e[2],

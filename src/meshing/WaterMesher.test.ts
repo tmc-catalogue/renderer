@@ -84,6 +84,56 @@ describe("water surfaces", () => {
 		expect(lava.depthWrite).toBe(true);
 	});
 
+	it("orders water faces from farthest to nearest and preserves the animation callback", () => {
+		const still = new THREE.DataArrayTexture(new Uint8Array(8), 1, 1, 2);
+		registerFluidAnimation(still, { animation: { frametime: 1 } });
+		const result = buildFluidMeshes((x) => (x === 0 || x === 2 ? "water" : "air"), 3, 1, 1, {
+			water: still,
+		});
+		meshes.push(...result.meshes);
+		const mesh = result.meshes[0];
+		const geometry = mesh.geometry;
+		const material = mesh.material as THREE.ShaderMaterial;
+		const camera = new THREE.PerspectiveCamera();
+		camera.position.set(10, 0, 0);
+		camera.lookAt(0, 0, 0);
+		camera.updateMatrixWorld();
+		const before = geometry.index!.version;
+		mesh.onBeforeRender(null as any, null as any, camera, geometry, material, null as any);
+		expect(geometry.index!.version).toBeGreaterThanOrEqual(before);
+		expect(material.uniforms.uTex.value).toBe(still);
+		const view = camera.matrixWorldInverse;
+		const depths = () =>
+			Array.from({ length: geometry.index!.count / 6 }, (_, face) => {
+				const pos = geometry.getAttribute("position");
+				const first = geometry.index!.getX(face * 6);
+				const sum = new THREE.Vector3();
+				for (let i = 0; i < 4; i++)
+					sum.add(new THREE.Vector3().fromBufferAttribute(pos, first + i));
+				return sum.multiplyScalar(0.25).applyMatrix4(view).z;
+			});
+		expect(depths()).toEqual([...depths()].sort((a, b) => a - b));
+		camera.position.set(-10, 0, 0);
+		camera.lookAt(0, 0, 0);
+		camera.updateMatrixWorld();
+		mesh.onBeforeRender(null as any, null as any, camera, geometry, material, null as any);
+		expect(depths()).toEqual([...depths()].sort((a, b) => a - b));
+		still.dispose();
+	});
+
+	it("partitions water in mixed glass sections without losing faces or splitting water-only scenes", () => {
+		const blocks = Array(20).fill("water");
+		const pure = build(blocks);
+		expect(pure.meshes).toHaveLength(1);
+		blocks[8] = "glass";
+		const mixed = build(blocks);
+		expect(mixed.meshes).toHaveLength(2);
+		expect(mixed.meshes.every((mesh) => mesh.renderOrder === 0)).toBe(true);
+		expect(mixed.meshes.reduce((sum, mesh) => sum + mesh.geometry.index!.count, 0)).toBe(
+			(19 * 4 + 4) * 6
+		);
+	});
+
 	it("animates still/flow textures at their native rates and removes disposed materials", () => {
 		const still = new THREE.DataArrayTexture(new Uint8Array(16), 1, 1, 4);
 		const flow = new THREE.DataArrayTexture(new Uint8Array(32), 1, 1, 8);

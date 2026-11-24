@@ -4,7 +4,10 @@ import { ResourcePackManager, DefaultPackCallback } from "./managers/ResourcePac
 import MeshBuilderWorker from "./workers/MeshBuilder.worker?worker&inline";
 import MeshBuilderWasmWorker from "./workers/MeshBuilderWasm.worker?worker&inline";
 import { getClampedPixelRatio } from "./utils/pixelRatio";
-import { initializeResourcePacks } from "./utils/initializeResourcePacks";
+import {
+	initializeResourcePacks,
+	reloadEnabledResourcePacks,
+} from "./utils/initializeResourcePacks";
 
 export interface SchematicRendererContextOptions {
 	/** Render unknown blocks as a purple placeholder (defaults to false). */
@@ -46,7 +49,10 @@ export class SchematicRendererContext {
 	public readonly resourcePackManager: ResourcePackManager;
 
 	// Renderers attached to this context, so pack changes can invalidate them all.
-	private readonly renderers = new Set<{ invalidate(): void }>();
+	private readonly renderers = new Set<{
+		invalidate(): void;
+		refreshResourceAssets?(): Promise<void>;
+	}>();
 
 	// Shared mesh-builder worker pool, created once and borrowed by every renderer's
 	// WorldMeshBuilder. The free-list/queue are shared so workers are lent exclusively;
@@ -83,6 +89,11 @@ export class SchematicRendererContext {
 		this.cubane = cubane;
 		this.resourcePackManager = resourcePackManager;
 		this.useSharedRenderer = useSharedRenderer;
+		resourcePackManager.setAtlasRebuildCallback(async () => {
+			await reloadEnabledResourcePacks(this.cubane, this.resourcePackManager);
+			await Promise.all([...this.renderers].map((renderer) => renderer.refreshResourceAssets?.()));
+			this.invalidateAll();
+		});
 	}
 
 	/**
@@ -133,7 +144,10 @@ export class SchematicRendererContext {
 	}
 
 	/** Register a renderer so pack changes can invalidate it. */
-	public attachRenderer(renderer: { invalidate(): void }): void {
+	public attachRenderer(renderer: {
+		invalidate(): void;
+		refreshResourceAssets?(): Promise<void>;
+	}): void {
 		this.renderers.add(renderer);
 	}
 
@@ -243,5 +257,6 @@ export class SchematicRendererContext {
 			this.sharedGLRenderer = null;
 		}
 		this.cubane.dispose();
+		this.resourcePackManager.dispose();
 	}
 }

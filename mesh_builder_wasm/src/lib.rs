@@ -876,6 +876,21 @@ impl MeshBuilder {
         origin_z: i32,
         apron_blocks: &Int32Array,
     ) -> Result<JsValue, JsValue> {
+        // The original greedy implementation assumes every solid model is a
+        // full cube with whole-texture UVs. Preserve exact face templates until
+        // an atlas-aware algorithm can prove a merge is equivalent.
+        self.build_chunk(blocks, origin_x, origin_y, origin_z, apron_blocks)
+    }
+
+    #[allow(dead_code)]
+    fn build_chunk_greedy_legacy(
+        &self,
+        blocks: &Int32Array,
+        origin_x: i32,
+        origin_y: i32,
+        origin_z: i32,
+        apron_blocks: &Int32Array,
+    ) -> Result<JsValue, JsValue> {
         let blocks_vec = blocks.to_vec();
         let block_count = blocks_vec.len() / 4;
         

@@ -67,6 +67,23 @@ describe("block model surfaces", () => {
 		const uv = (mesh.children[0] as THREE.Mesh).geometry.getAttribute("uv");
 		expect([...uv.array]).toEqual([0.875, 1, 0.125, 1, 0.875, 0.875, 0.125, 0.875]);
 	});
+	it("keeps blockstate-rotated UVs world aligned only when uvlock is true", async () => {
+		const model: BlockModel = {
+			elements: [
+				{ from: [0, 0, 0], to: [16, 16, 16], faces: { up: { texture: "block/asymmetric" } } },
+			],
+		};
+		const uv = async (uvlock: boolean) => {
+			const mesh = await builder().createBlockMesh(model, { y: 90, uvlock });
+			return Array.from((mesh.children[0] as THREE.Mesh).geometry.getAttribute("uv").array);
+		};
+		expect(await uv(false)).toEqual([0, 1, 1, 1, 0, 0, 1, 0]);
+		expect(await uv(true)).toEqual([1, 1, 1, 0, 0, 1, 0, 0]);
+		const optimized = await builder().createOptimizedFaceData(model, { y: 90, uvlock: true });
+		expect(Array.from(optimized.nonCullableFaces[0].geometry.getAttribute("uv").array)).toEqual(
+			await uv(true)
+		);
+	});
 
 	it("tags every bubble-column face as water so the shared surface replaces it", async () => {
 		const mesh = await builder().createBlockMesh(

@@ -11,6 +11,68 @@ interface GeometryGroup {
 	isLava?: boolean;
 }
 
+// Canonical world UV axes for each Minecraft face. Cache the 6 × 16 possible
+// blockstate rotation results instead of allocating vectors for every face.
+const FACE_UV_AXES: Record<
+	string,
+	[[number, number, number], [number, number, number], [number, number, number]]
+> = {
+	south: [
+		[1, 0, 0],
+		[0, 1, 0],
+		[0, 0, 1],
+	],
+	north: [
+		[-1, 0, 0],
+		[0, 1, 0],
+		[0, 0, -1],
+	],
+	west: [
+		[0, 0, 1],
+		[0, 1, 0],
+		[-1, 0, 0],
+	],
+	east: [
+		[0, 0, -1],
+		[0, 1, 0],
+		[1, 0, 0],
+	],
+	up: [
+		[1, 0, 0],
+		[0, 0, -1],
+		[0, 1, 0],
+	],
+	down: [
+		[1, 0, 0],
+		[0, 0, 1],
+		[0, -1, 0],
+	],
+};
+const uvLockTransforms = new Map<string, [number, number]>();
+function uvLockTransform(direction: string, x: number, y: number): [number, number] {
+	const key = `${direction}:${x}:${y}`;
+	const cached = uvLockTransforms.get(key);
+	if (cached) return cached;
+	const axes = FACE_UV_AXES[direction];
+	if (!axes) return [1, 0];
+	const rotation = new THREE.Matrix4()
+		.makeRotationY(-THREE.MathUtils.degToRad(y))
+		.multiply(new THREE.Matrix4().makeRotationX(-THREE.MathUtils.degToRad(x)));
+	const normal = new THREE.Vector3(...axes[2]).transformDirection(rotation);
+	const right = new THREE.Vector3(...axes[0]).transformDirection(rotation);
+	const target = Object.values(FACE_UV_AXES).find(
+		(axis) => normal.dot(new THREE.Vector3(...axis[2])) > 0.999
+	);
+	const result: [number, number] = target
+		? [
+				Math.round(right.dot(new THREE.Vector3(...target[0]))),
+				Math.round(right.dot(new THREE.Vector3(...target[1]))),
+			]
+		: [1, 0];
+	uvLockTransforms.set(key, result);
+	return result;
+}
+
 export class BlockMeshBuilder {
 	private assetLoader: AssetLoader;
 	// When false (default), blocks Cubane can't build render nothing instead of
@@ -376,14 +438,6 @@ export class BlockMeshBuilder {
 				light_emission: element.light_emission,
 			};
 
-			// Create a temporary PlaneGeometry to get the correct vertex positions and UVs
-			const tempFaceResult = await this.createTempFaceGeometry(
-				direction,
-				elementSize,
-				faceData,
-				transform
-			);
-
 			// Get material (same as before)
 			let texturePath = this.assetLoader.resolveTexture(faceData.texture, model);
 			const isWater = this.isWaterBlock(blockData);
@@ -395,6 +449,14 @@ export class BlockMeshBuilder {
 			} else if (isLava) {
 				texturePath = direction === "up" ? "block/lava_still" : "block/lava_flow";
 			}
+			// Derive local vertices/UVs using the actual texture (fluids must not rotate their UVs).
+			const tempFaceResult = await this.createTempFaceGeometry(
+				direction,
+				elementSize,
+				faceData,
+				transform,
+				texturePath
+			);
 
 			const material = await this.createFaceMaterial(
 				texturePath,
@@ -468,7 +530,8 @@ export class BlockMeshBuilder {
 		direction: string,
 		elementSize: number[],
 		faceData: any,
-		transform: { x?: number; y?: number; uvlock?: boolean }
+		transform: { x?: number; y?: number; uvlock?: boolean },
+		texturePath?: string
 	): Promise<{ vertices: number[][]; uvs: number[]; indices: number[] }> {
 		// Replicate the EXACT same logic as the working createFaceGeometry
 		let geometry: THREE.PlaneGeometry;
@@ -511,7 +574,7 @@ export class BlockMeshBuilder {
 		geometry.translate(...facePositionOffset);
 
 		// Apply the SAME UV mapping logic that works
-		this.mapUVCoordinates(geometry, direction, faceData, transform);
+		this.mapUVCoordinates(geometry, direction, faceData, transform, texturePath);
 
 		// Extract vertex positions, UVs, AND indices from the working geometry
 		const positions = geometry.attributes.position.array as Float32Array;
@@ -788,43 +851,30 @@ export class BlockMeshBuilder {
 			1 - v2, // Bottom-right
 		]);
 
-		// Calculate total rotation including face rotation and block transform rotation
+		// Face rotations are local; ordinary block rotation rotates geometry and UVs
+		// together. Only uvlock compensates that rotation to preserve world alignment.
 		let totalRotation = faceData.rotation || 0;
-
-		// Apply block rotation if uvlock is not enabled
-		if (transform.uvlock !== true) {
-			const yRot = transform.y || 0;
-
-			switch (direction) {
-				case "up":
-					totalRotation += yRot;
-					break;
-				case "down":
-					totalRotation -= yRot;
-					break;
-				case "north":
-					totalRotation += yRot;
-					break;
-				case "south":
-					totalRotation -= yRot;
-					break;
-				case "east":
-					totalRotation += yRot;
-					break;
-				case "west":
-					totalRotation -= yRot;
-					break;
-			}
-		}
 
 		// Normalize and apply rotation — EXCEPT on liquid textures: side faces'
 		// V axis must stay world-vertical (the record shader scrolls V for connected
 		// downward flow; model per-face rotation turns V into world-horizontal)
-		if (/(water|lava)_(still|flow)$/.test(String(texturePath || ""))) totalRotation = 0;
+		const fluid = /^(?:minecraft:)?block\/(water|lava)_(still|flow)$/.test(
+			String(texturePath || "")
+		);
+		if (fluid) totalRotation = 0;
 		totalRotation = ((totalRotation % 360) + 360) % 360;
 		if (totalRotation !== 0) {
 			const roundedRotation = Math.round(totalRotation / 90) * 90;
 			this.applyUVRotation(uvCoords, roundedRotation);
+		}
+		if (!fluid && transform.uvlock && (transform.x || transform.y)) {
+			const [cos, sin] = uvLockTransform(direction, transform.x || 0, transform.y || 0);
+			for (let i = 0; i < uvCoords.length; i += 2) {
+				const u = uvCoords[i] - 0.5,
+					v = uvCoords[i + 1] - 0.5;
+				uvCoords[i] = 0.5 + cos * u - sin * v;
+				uvCoords[i + 1] = 0.5 + sin * u + cos * v;
+			}
 		}
 
 		// Set the UVs (these are still in local 0-1 space, will be transformed to atlas space later)
@@ -896,7 +946,11 @@ export class BlockMeshBuilder {
 			);
 
 			for (const face of elementFaces) {
-				if (face.material.transparent || face.material.opacity < 1.0) {
+				if (
+					face.material.transparent ||
+					face.material.opacity < 1.0 ||
+					face.material.alphaTest > 0
+				) {
 					hasTransparency = true;
 				}
 
@@ -1256,15 +1310,18 @@ export class BlockMeshBuilder {
 
 	private isLiquidBlock(blockData?: Block): boolean {
 		if (!blockData) return false;
-		const blockId = `${blockData.namespace}:${blockData.name}`;
-		return this.isWaterBlock(blockData) || blockId === "minecraft:lava";
+		return this.isWaterBlock(blockData) || this.isLavaBlock(blockData);
 	}
 
 	private isWaterBlock(blockData?: Block): boolean {
 		if (!blockData) return false;
 
 		const blockId = `${blockData.namespace}:${blockData.name}`;
-		return blockId === "minecraft:water" || blockId === "minecraft:bubble_column";
+		return (
+			blockId === "minecraft:water" ||
+			blockId === "minecraft:flowing_water" ||
+			blockId === "minecraft:bubble_column"
+		);
 	}
 
 	// Blocks that are implicitly waterlogged in vanilla — they hold water without
@@ -1285,7 +1342,10 @@ export class BlockMeshBuilder {
 
 	private isLavaBlock(blockData?: Block): boolean {
 		if (!blockData) return false;
-		return `${blockData.namespace}:${blockData.name}` === "minecraft:lava";
+		return (
+			blockData.namespace === "minecraft" &&
+			(blockData.name === "lava" || blockData.name === "flowing_lava")
+		);
 	}
 
 	// This function assumes uvCoords are [TL, TR, BL, BR]

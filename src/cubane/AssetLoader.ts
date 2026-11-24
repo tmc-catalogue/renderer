@@ -7,6 +7,7 @@ import { AtlasBuilder } from "./AtlasBuilder";
 import { ResourcePackManager } from "./ResourcePackManager";
 import { createFluidFrameTexture, tintWaterPixels, WATER_OPACITY } from "../meshing/WaterTextures";
 import type { FluidTextures } from "../meshing/WaterMesher";
+import { analyzeRGBA, type TextureAlphaInfo } from "./TextureAlpha";
 
 const FLUID_TEXTURES = [
 	["water", "water_still"],
@@ -15,6 +16,15 @@ const FLUID_TEXTURES = [
 	["lavaFlow", "lava_flow"],
 	["waterOverlay", "water_overlay"],
 ] as const;
+
+const emptyFluidTextures = (): FluidTextures =>
+	Object.fromEntries(FLUID_TEXTURES.map(([key]) => [key, null]));
+
+/** Map category/namespace:path to the matching ZIP asset, without aliasing vanilla. */
+function resourceZipPath(path: string): string {
+	const match = /^([^/]+)\/([a-z0-9_.-]+):(.+)$/.exec(path);
+	return match ? `assets/${match[2]}/${match[1]}/${match[3]}` : `assets/minecraft/${path}`;
+}
 
 export class AssetLoader {
 	private resourcePacks: Map<string, JSZip> = new Map();
@@ -32,12 +42,15 @@ export class AssetLoader {
 	private modelCache: Map<string, BlockModel> = new Map();
 	private textureCache: Map<string, THREE.Texture> = new Map();
 	private materialCache: Map<string, THREE.Material> = new Map();
+	private textureOpacityCache = new WeakMap<THREE.Texture, Map<string, TextureAlphaInfo>>();
 	private resourceGeneration = 0;
+	private disposed = false;
+	private atlasBuildLoad: { generation: number; promise: Promise<THREE.Texture> } | null = null;
 	private fluidFramesLoad: {
 		promise: Promise<void>;
 		textures: FluidTextures;
-		registry?: FluidTextures;
 	} | null = null;
+	private readonly noFluidTextures = emptyFluidTextures();
 
 	// Texture loader
 	private textureLoader = new THREE.TextureLoader();
@@ -50,7 +63,7 @@ export class AssetLoader {
 	// layout rules, liquid frame harvests) — the pack hash alone can't see code
 	// generations, so stale atlases served across upgrades (the "yellow water"
 	// class of bug: new code sampling an old-layout cache)
-	private static readonly ATLAS_FORMAT_VERSION = 3;
+	private static readonly ATLAS_FORMAT_VERSION = 4;
 	private resourcePackHash: string = "";
 	private cacheEnabled: boolean = true;
 
@@ -78,7 +91,7 @@ export class AssetLoader {
 	 * Rebuild atlas from ResourcePackManager's packs
 	 */
 	private async rebuildFromPackManager(): Promise<void> {
-		if (!this.packManager) return;
+		if (this.disposed || !this.packManager) return;
 		this.invalidatePackAssets();
 
 		// Recalculate hash from enabled packs for cache key
@@ -95,6 +108,7 @@ export class AssetLoader {
 	/** Release all assets derived from the previous pack stack. */
 	private invalidatePackAssets(): void {
 		this.resourceGeneration++;
+		this.atlasBuildLoad = null;
 		this.resourcePackHash = "";
 		this.invalidateFluidFrames();
 
@@ -169,6 +183,7 @@ export class AssetLoader {
 	 * Load a resource pack from a blob
 	 */
 	public async loadResourcePack(blob: Blob): Promise<void> {
+		if (this.disposed) throw new Error("AssetLoader disposed");
 		if (this.usePackManager && this.packManager) {
 			await this.packManager.loadPackFromBlob(blob);
 			return;
@@ -199,7 +214,7 @@ export class AssetLoader {
 
 			// Filter and log structure
 			const assetFiles = Object.keys(zip.files).filter(
-				(path) => path.includes("assets/minecraft/") && !zip.files[path].dir
+				(path) => /^assets\/[^/]+\//.test(path) && !zip.files[path].dir
 			);
 			const blockstates = assetFiles.filter((p) => p.includes("blockstates/"));
 			const models = assetFiles.filter((p) => p.includes("models/"));
@@ -217,6 +232,7 @@ export class AssetLoader {
 						`${this.resourcePackHash}:${await this.calculateResourcePackHash(arrayBuffer)}`
 					)
 				: "";
+			if (this.disposed) throw new Error("AssetLoader disposed");
 			const packId = `pack_${this.resourceGeneration}`;
 			this.resourcePacks.set(packId, zip);
 			this.resourcePackOrder.unshift(packId);
@@ -260,7 +276,7 @@ export class AssetLoader {
 
 		// Try each resource pack in order of priority (highest first)
 		for (const { id: packId, zip } of this.getOrderedPacks()) {
-			const file = zip.file(`assets/minecraft/${path}`);
+			const file = zip.file(resourceZipPath(path));
 			if (file) {
 				try {
 					const content = await file.async("string");
@@ -287,7 +303,7 @@ export class AssetLoader {
 	public async getResourceBlob(path: string): Promise<Blob | undefined> {
 		// Try each resource pack in order of priority (highest first)
 		for (const { id: packId, zip } of this.getOrderedPacks()) {
-			const file = zip.file(`assets/minecraft/${path}`);
+			const file = zip.file(resourceZipPath(path));
 			if (file) {
 				try {
 					return await file.async("blob");
@@ -351,7 +367,7 @@ export class AssetLoader {
 		}
 
 		// Special handling for liquid models with level information
-		if (modelPath.startsWith("block/water") || modelPath.startsWith("block/lava")) {
+		if (/^block\/(water|lava)(?:_level_\d+)?$/.test(modelPath)) {
 			const isWater = modelPath.startsWith("block/water");
 
 			// Extract level from model path if present
@@ -572,6 +588,7 @@ export class AssetLoader {
 	}
 
 	public async getTexture(texturePath: string): Promise<THREE.Texture> {
+		if (this.disposed) throw new Error("AssetLoader disposed");
 		const generation = this.resourceGeneration;
 		// Handle missing texture path
 		if (
@@ -900,6 +917,63 @@ export class AssetLoader {
 		return this.textureAtlas; // Return the single shared instance
 	}
 
+	public getResourceGeneration(): number {
+		return this.resourceGeneration;
+	}
+
+	/** Check the original tile, not the shared atlas (which also contains glass and padding). */
+	private textureAlpha(
+		texture: THREE.Texture,
+		rect: { u: number; v: number; width: number; height: number } | null
+	): TextureAlphaInfo {
+		// Interpolated animations upload one frame at a time, but the depth pass
+		// must be based on the original alpha of every frame in the sprite.
+		const sourceAlpha = texture.userData.sourceAlpha as TextureAlphaInfo["alpha"] | undefined;
+		if (!rect && sourceAlpha)
+			return { alpha: sourceAlpha, hasOpaquePixels: !!texture.userData.sourceHasOpaquePixels };
+		const key = rect ? `${rect.u}:${rect.v}:${rect.width}:${rect.height}` : "whole";
+		let cache = this.textureOpacityCache.get(texture);
+		if (cache?.has(key)) return cache.get(key)!;
+		const image = texture.image as (HTMLImageElement | HTMLCanvasElement | ImageBitmap) | undefined;
+		const unknown: TextureAlphaInfo = { alpha: "blend", hasOpaquePixels: false };
+		if (!image?.width || !image?.height) return unknown;
+
+		try {
+			let pixels: ArrayLike<number>;
+			if (rect) {
+				const ctx = (image as HTMLCanvasElement).getContext("2d", { willReadFrequently: true });
+				if (!ctx) return unknown;
+				pixels = ctx.getImageData(
+					Math.round(rect.u * image.width),
+					Math.round(rect.v * image.height),
+					Math.round(rect.width * image.width),
+					Math.round(rect.height * image.height)
+				).data;
+			} else if (
+				texture instanceof THREE.DataTexture &&
+				texture.format === THREE.RGBAFormat &&
+				texture.type === THREE.UnsignedByteType
+			) {
+				pixels = texture.image.data as Uint8Array;
+			} else {
+				const canvas = document.createElement("canvas");
+				canvas.width = image.width;
+				canvas.height = image.height;
+				const ctx = canvas.getContext("2d");
+				if (!ctx) return unknown;
+				ctx.drawImage(image, 0, 0);
+				pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+			}
+			const alpha = analyzeRGBA(pixels);
+			if (!cache) this.textureOpacityCache.set(texture, (cache = new Map()));
+			cache.set(key, alpha);
+			return alpha;
+		} catch {
+			// If pixels cannot be read, retain the previous conservative material defaults.
+			return unknown;
+		}
+	}
+
 	public async getMaterial(
 		texturePath: string,
 		options: {
@@ -918,6 +992,7 @@ export class AssetLoader {
 			useAtlas?: boolean;
 		} = {}
 	): Promise<THREE.Material> {
+		if (this.disposed) throw new Error("AssetLoader disposed");
 		const generation = this.resourceGeneration;
 		const useAtlas = options.useAtlas ?? true;
 
@@ -942,7 +1017,7 @@ export class AssetLoader {
 		}
 
 		// Keep the supplied still/flow water texture; waterfall sides use water_flow.
-		const finalTexturePath = options.isLava ? "block/lava_still" : texturePath;
+		const finalTexturePath = texturePath;
 
 		let texture: THREE.Texture;
 		let atlasUVData: {
@@ -952,14 +1027,10 @@ export class AssetLoader {
 			height: number;
 		} | null = null;
 		let usingAtlas = false;
-		let animData: { frames: number; step: number } | null = null;
 
-		// Any texture with an .mcmeta sidecar is animated (kelp, seagrass, sea
-		// lanterns, magma, prismarine, …) — not just liquids. Liquids are always
-		// treated as animated. Animated textures need per-frame UV offsets, so they
-		// can't share the static atlas and must render as individual scrolling
-		// textures. Non-animated textures still fall through to the atlas below so
-		// batching is preserved.
+		// A moving frame can't modify the UV transform of the static shared atlas.
+		// Keep one individual texture per animated sprite; CPU and GPU meshes can
+		// then share the same frame transform and resource-pack animation timeline.
 		const isAnimated =
 			options.isLiquid ||
 			options.forceAnimation ||
@@ -968,47 +1039,7 @@ export class AssetLoader {
 		if (isAnimated) {
 			const animatedTexture =
 				await this.animatedTextureManager.createAnimatedTexture(finalTexturePath);
-			// fallback first; overridden below when the atlas rect is found
 			texture = animatedTexture || (await this.getTexture(finalTexturePath));
-			// Animated strips can't scroll inside the shared atlas, so these materials
-			// historically kept an individual 0..1-UV texture. That renders fine in the
-			// CPU modes (each group binds its own material) but is WRONG for the GPU
-			// record paths, which sample ONE shared atlas with the template UVs — the
-			// un-remapped 0..1 UVs sweep the entire atlas and the block reads black
-			// (sea lantern, magma, prismarine, sculk…). Unify on the atlas with a
-			// static FIRST-FRAME sub-rect: every mode gets correct pixels, at the cost
-			// of per-material scrolling in the CPU modes (frame animation can return
-			// later as a shader-side frame offset on the records path).
-			if (useAtlas && this.textureAtlas) {
-				let rect = this.getTextureUV(finalTexturePath);
-				if (!rect) {
-					for (const variation of [
-						finalTexturePath.replace("minecraft:", ""),
-						`block/${finalTexturePath.replace("minecraft:", "").replace("block/", "")}`,
-						texturePath.replace("minecraft:", ""),
-						`block/${texturePath.replace("minecraft:", "").replace("block/", "")}`,
-					]) {
-						rect = this.getTextureUV(variation);
-						if (rect) break;
-					}
-				}
-				if (rect) {
-					// strips are 1 tile wide, so the frame count is height/width in tiles
-					const frames = Math.max(1, Math.round(rect.height / rect.width));
-					atlasUVData = {
-						u: rect.u,
-						v: rect.v,
-						width: rect.width,
-						height: rect.height / frames, // frame 0 = top slice of the strip
-					};
-					// animation params for the record/bypass paths: signed frames go in
-					// uv.w and the frame step in pos.w of the template tables; the
-					// shaders slide V down the strip to animate
-					animData = frames > 1 ? { frames, step: atlasUVData.height } : null;
-					texture = this.getSharedAtlasTexture()!;
-					usingAtlas = true;
-				}
-			}
 		} else if (useAtlas && this.textureAtlas) {
 			// Use shared atlas texture
 			texture = this.getSharedAtlasTexture()!;
@@ -1016,7 +1047,10 @@ export class AssetLoader {
 			// Get UV coordinates for this texture within the atlas
 			atlasUVData = this.getTextureUV(finalTexturePath);
 
-			if (!atlasUVData) {
+			if (
+				!atlasUVData &&
+				(!finalTexturePath.includes(":") || finalTexturePath.startsWith("minecraft:"))
+			) {
 				// Try variations
 				const variations = [
 					finalTexturePath.replace("minecraft:", ""),
@@ -1047,11 +1081,20 @@ export class AssetLoader {
 			usingAtlas = false;
 		}
 
-		// Create material
+		// Classify complete sprites (or their precise atlas tile), including all
+		// animation frames. Cutouts are depth-writing, unlike blended transparency.
+		const alphaInfo: TextureAlphaInfo = options.isLava
+			? { alpha: "opaque", hasOpaquePixels: true }
+			: options.isWater
+				? { alpha: "blend", hasOpaquePixels: false }
+				: this.textureAlpha(texture, atlasUVData);
+		const { alpha } = alphaInfo;
+		const blended = options.transparent ?? (alpha === "blend" || (options.opacity ?? 1) < 1);
 		const materialOptions: any = {
 			map: texture,
-			transparent: options.transparent ?? true,
-			alphaTest: options.alphaTest ?? 0.01,
+			transparent: blended,
+			alphaTest: options.alphaTest ?? (alpha === "opaque" ? 0 : blended ? 0.01 : 0.5),
+			depthWrite: !blended,
 			side: THREE.FrontSide,
 		};
 
@@ -1081,11 +1124,12 @@ export class AssetLoader {
 			materialOptions.emissiveIntensity = Math.min(15, Math.max(0, options.lightEmission)) / 15;
 		}
 		const material = new THREE.MeshStandardMaterial(materialOptions);
+		material.userData.alphaClass = alpha;
+		material.userData.hasOpaquePixels = alphaInfo.hasOpaquePixels;
 
 		// Store atlas UV data in userData
 		if (usingAtlas && atlasUVData) {
 			material.userData.atlasUV = atlasUVData;
-			material.userData.anim = animData; // {frames, step} for strip animation
 			material.userData.useAtlas = true;
 			material.userData.texturePath = finalTexturePath;
 		} else {
@@ -1275,30 +1319,25 @@ export class AssetLoader {
 		for (const [key] of FLUID_TEXTURES) {
 			const texture = load.textures[key];
 			if (!texture) continue;
-			if (load.registry?.[key] === texture) load.registry[key] = null;
+			load.textures[key] = null;
 			texture.dispose();
 		}
-		load.textures = {};
+	}
+
+	/** The current pack generation's fluid frames; never shared across AssetLoaders. */
+	public getFluidTextures(): FluidTextures {
+		return this.fluidFramesLoad?.textures ?? this.noFluidTextures;
 	}
 
 	/** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
 	private loadFluidFrames(): Promise<void> {
-		if (this.fluidFramesLoad) {
-			const load = this.fluidFramesLoad;
-			return load.promise.then(() => {
-				// Other Cubane instances share the registry, but own their textures.
-				if (this.fluidFramesLoad === load && load.registry)
-					Object.assign(load.registry, load.textures);
-			});
-		}
+		if (this.fluidFramesLoad) return this.fluidFramesLoad.promise;
 		const load: NonNullable<AssetLoader["fluidFramesLoad"]> = {
 			promise: Promise.resolve(),
-			textures: {},
+			textures: emptyFluidTextures(),
 		};
 		this.fluidFramesLoad = load;
 		load.promise = (async () => {
-			const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
-			load.registry = liquidFrameTextures;
 			const entries = await Promise.all(
 				FLUID_TEXTURES.map(async ([key, path]) => {
 					let image: ImageBitmap | undefined;
@@ -1333,13 +1372,12 @@ export class AssetLoader {
 					return [key, frames] as const;
 				})
 			);
-			load.textures = Object.fromEntries(entries);
+			Object.assign(load.textures, Object.fromEntries(entries));
 			// A pack switch or disposal can finish while the PNGs are decoding.
 			if (this.fluidFramesLoad !== load) {
 				this.releaseFluidFrames(load);
 				return;
 			}
-			Object.assign(liquidFrameTextures, load.textures);
 		})().catch((error) => {
 			if (this.fluidFramesLoad === load) this.fluidFramesLoad = null;
 			this.releaseFluidFrames(load);
@@ -1348,8 +1386,20 @@ export class AssetLoader {
 		return load.promise;
 	}
 
-	public async buildTextureAtlas(): Promise<THREE.Texture> {
+	public buildTextureAtlas(): Promise<THREE.Texture> {
+		if (this.disposed) return Promise.reject(new Error("AssetLoader disposed"));
 		const generation = this.resourceGeneration;
+		if (this.atlasBuildLoad?.generation === generation) return this.atlasBuildLoad.promise;
+		const promise = this.buildTextureAtlasGeneration(generation);
+		this.atlasBuildLoad = { generation, promise };
+		const clear = () => {
+			if (this.atlasBuildLoad?.promise === promise) this.atlasBuildLoad = null;
+		};
+		void promise.then(clear, clear);
+		return promise;
+	}
+
+	private async buildTextureAtlasGeneration(generation: number): Promise<THREE.Texture> {
 		// Colormaps are independent of the atlas; load them before the early-return
 		// so biome tints are available even when the atlas is served from cache.
 		await this.loadColormaps();
@@ -1416,7 +1466,7 @@ export class AssetLoader {
 			const t0 = performance.now();
 			for (const { zip } of this.getOrderedPacks()) {
 				const modelFiles = Object.keys(zip.files).filter(
-					(p) => p.includes("assets/minecraft/models/") && p.endsWith(".json") && !zip.files[p].dir
+					(p) => /^assets\/[^/]+\/models\/.+\.json$/.test(p) && !zip.files[p].dir
 				);
 				const chunks: string[][] = [];
 				for (let i = 0; i < modelFiles.length; i += 100) chunks.push(modelFiles.slice(i, i + 100));
@@ -1451,10 +1501,7 @@ export class AssetLoader {
 
 		for (const { zip } of this.getOrderedPacks()) {
 			const files = Object.keys(zip.files).filter(
-				(path) =>
-					path.includes("assets/minecraft/textures/") &&
-					path.endsWith(".png") &&
-					!zip.files[path].dir
+				(path) => /^assets\/[^/]+\/textures\/.+\.png$/.test(path) && !zip.files[path].dir
 			);
 
 			// Chests render via getEntityTexture (entity/chest/*) which no blockstate
@@ -1475,16 +1522,17 @@ export class AssetLoader {
 			])
 				referenced.add(ep);
 			for (const file of files) {
-				const relativePath = file.replace("assets/minecraft/textures/", "");
-				const texturePath = relativePath.replace(".png", "");
+				const [, namespace, relativePath] = /^assets\/([^/]+)\/textures\/(.+)\.png$/.exec(file)!;
+				const texturePath =
+					namespace === "minecraft" ? relativePath : `${namespace}:${relativePath}`;
 
 				totalFound++;
 
 				// Check if texture path starts with any allowed path
-				if (allowedPaths.some((allowed) => texturePath.startsWith(allowed))) {
+				if (allowedPaths.some((allowed) => relativePath.startsWith(allowed))) {
 					if (referenced.size === 0 || referenced.has(texturePath)) {
 						allTextures.add(texturePath);
-						if (texturePath.startsWith("entity/"))
+						if (relativePath.startsWith("entity/"))
 							console.log(`[atlas] collected entity texture: ${texturePath}`);
 					}
 				}
@@ -1555,7 +1603,11 @@ export class AssetLoader {
 		// invalidate at different moments, so a cached atlas can pair with geometry
 		// whose UVs were baked for a different layout (black tiles / flip-flopping
 		// chests+dust). A cold atlas build is ~2s once per session — cheap for coherence.
-		const { atlas, uvMap, packingEfficiency } = await atlasBuilder.buildAtlas(textures);
+		const { atlas, uvMap, packingEfficiency } = await atlasBuilder
+			.buildAtlas(textures)
+			.finally(() => {
+				for (const { image } of textures) image.close?.();
+			});
 		if (generation !== this.resourceGeneration) return this.buildTextureAtlas();
 
 		console.log(`✅ Atlas built with ${packingEfficiency.toFixed(1)}% efficiency`);
@@ -1615,11 +1667,10 @@ export class AssetLoader {
 	 * Force rebuild atlas (ignores cache)
 	 */
 	public async rebuildTextureAtlas(): Promise<THREE.Texture> {
-		this.invalidateFluidFrames();
-		this.invalidateColormaps();
-		// Clear current atlas
-		this.textureAtlas = null;
-		this.textureUVMap.clear();
+		if (this.disposed) throw new Error("AssetLoader disposed");
+		const hash = this.resourcePackHash;
+		this.invalidatePackAssets();
+		this.resourcePackHash = hash;
 
 		// Temporarily disable cache
 		const wasCacheEnabled = this.cacheEnabled;
@@ -1643,15 +1694,12 @@ export class AssetLoader {
 
 		for (const { zip } of this.getOrderedPacks()) {
 			const files = Object.keys(zip.files).filter(
-				(path) =>
-					path.includes("assets/minecraft/blockstates/") &&
-					path.endsWith(".json") &&
-					!zip.files[path].dir
+				(path) => /^assets\/[^/]+\/blockstates\/.+\.json$/.test(path) && !zip.files[path].dir
 			);
 
 			for (const file of files) {
-				const blockId = file.replace("assets/minecraft/blockstates/", "").replace(".json", "");
-				blockstatesSet.add(`minecraft:${blockId}`);
+				const [, namespace, blockId] = /^assets\/([^/]+)\/blockstates\/(.+)\.json$/.exec(file)!;
+				blockstatesSet.add(`${namespace}:${blockId}`);
 			}
 		}
 
@@ -1751,25 +1799,16 @@ export class AssetLoader {
 	 * Clean up resources
 	 */
 	public dispose(): void {
-		this.invalidateFluidFrames();
-		this.invalidateColormaps();
+		if (this.disposed) return;
+		this.disposed = true;
+		this.invalidatePackAssets();
 		this.tintManager.setColormaps(null, null, null);
-		// Dispose of all textures
-		this.textureCache.forEach((texture) => texture.dispose());
-		this.textureCache.clear();
-
-		// Dispose of all materials
-		this.materialCache.forEach((material) => material.dispose());
-		this.materialCache.clear();
-
-		// Clear other caches
-		this.blockStateCache.clear();
-		this.modelCache.clear();
-		this.stringCache.clear();
 
 		// Clear resource packs
 		this.resourcePacks.clear();
 		this.resourcePackOrder = [];
+		this.packManager = null;
+		this.usePackManager = false;
 
 		// Reset cache hash
 		this.resourcePackHash = "";

@@ -14,18 +14,9 @@ export class InstancedBlockRenderer {
 	) {}
 
 	private createBlockTypeKey(blockData: any, paletteIndex: number): string {
-		const blockState = this.paletteCache?.blockData?.[paletteIndex];
-		if (!blockState) return `unknown_${paletteIndex}`;
-
-		const properties = blockState.properties || {};
-		const propertyString =
-			Object.keys(properties).length > 0
-				? `[${Object.entries(properties)
-						.map(([k, v]) => `${k}=${v}`)
-						.join(",")}]`
-				: "";
-
-		return `${blockData.blockName}${propertyString}`;
+		// Palette index already identifies the exact block state; blockData only
+		// contains a name, so using that name silently aliases different variants.
+		return `${blockData.blockName}#${paletteIndex}`;
 	}
 
 	private mergeGeometriesManual(geometries: THREE.BufferGeometry[]): THREE.BufferGeometry | null {
@@ -194,53 +185,32 @@ export class InstancedBlockRenderer {
 			}
 			uniqueBlockTypes.add(blockTypeKey);
 
-			const geometriesToMerge = blockData.materialGroups
-				.map((group: any) => group.baseGeometry)
-				.filter(
-					(geo: THREE.BufferGeometry) =>
-						geo && geo.attributes.position && geo.attributes.position.count > 0
-				);
-
-			if (geometriesToMerge.length === 0) {
-				console.warn(`No valid geometries for ${blockTypeKey}`);
-				return;
+			// Merge only compatible geometry sharing one material. This retains the
+			// efficient instanced draw without flattening every face into material 0.
+			const byMaterial = new Map<THREE.Material, THREE.BufferGeometry[]>();
+			for (const part of blockData.materialGroups) {
+				if (!part.material || !part.baseGeometry?.attributes.position?.count) continue;
+				let list = byMaterial.get(part.material);
+				if (!list) byMaterial.set(part.material, (list = []));
+				list.push(part.baseGeometry);
 			}
-
-			const mergedGeometry = this.mergeGeometriesManual(geometriesToMerge);
-
-			if (!mergedGeometry || mergedGeometry.attributes.position.count === 0) {
-				console.warn(`Failed to merge geometries for ${blockTypeKey}`);
-				return;
+			const meshes: THREE.InstancedMesh[] = [];
+			for (const [material, geometries] of byMaterial) {
+				const geometry = this.mergeGeometriesManual(geometries);
+				if (!geometry) continue;
+				const mesh = new THREE.InstancedMesh(geometry, material, this.maxInstancesPerType);
+				mesh.name = `instanced_${blockTypeKey}_merged_${meshes.length}`;
+				mesh.userData.paletteIndex = paletteIndex;
+				mesh.userData.blockTypeKey = blockTypeKey;
+				mesh.userData.ownsMergedGeometry = true;
+				this.configureMeshForCategory(mesh, blockData.category);
+				mesh.visible = false;
+				mesh.count = 0;
+				meshes.push(mesh);
+				this.group.add(mesh);
 			}
-
-			const materials = blockData.materialGroups
-				.map((group: any) => group.material)
-				.filter((mat: THREE.Material) => mat);
-
-			const material = materials[0];
-
-			const instancedMesh = new THREE.InstancedMesh(
-				mergedGeometry,
-				material,
-				this.maxInstancesPerType
-			);
-
-			instancedMesh.name = `instanced_${blockTypeKey}_merged`;
-			instancedMesh.userData.paletteIndex = paletteIndex;
-			instancedMesh.userData.blockTypeKey = blockTypeKey;
-
-			this.configureMeshForCategory(instancedMesh, blockData.category);
-
-			instancedMesh.visible = false;
-			instancedMesh.count = 0;
-
-			this.instancedMeshes.set(blockTypeKey, [instancedMesh]);
+			this.instancedMeshes.set(blockTypeKey, meshes);
 			this.instanceCounts.set(blockTypeKey, 0);
-			this.group.add(instancedMesh);
-
-			console.log(
-				`Created merged instanced mesh for ${blockTypeKey} with ${mergedGeometry.attributes.position.count} vertices`
-			);
 		});
 
 		console.log(
@@ -394,18 +364,7 @@ export class InstancedBlockRenderer {
 		mesh.receiveShadow = true;
 		mesh.frustumCulled = false;
 
-		const material = mesh.material as THREE.Material;
-
 		switch (category) {
-			case "water":
-				mesh.renderOrder = 3;
-				// The shared liquid category includes lava. Preserve each fluid
-				// material's opacity and depth settings from AssetLoader.
-				break;
-			case "transparent":
-				mesh.renderOrder = 2;
-				material.transparent = true;
-				break;
 			case "emissive":
 				mesh.renderOrder = 1;
 				break;
@@ -419,6 +378,7 @@ export class InstancedBlockRenderer {
 		this.instancedMeshes.forEach((meshes) => {
 			meshes.forEach((mesh) => {
 				this.group.remove(mesh);
+				if (mesh.userData.ownsMergedGeometry) mesh.geometry.dispose();
 				mesh.dispose();
 			});
 		});
@@ -427,6 +387,11 @@ export class InstancedBlockRenderer {
 	}
 
 	public getInstancedMeshes(blockName: string): THREE.InstancedMesh[] {
-		return this.instancedMeshes.get(blockName) || [];
+		return (
+			this.instancedMeshes.get(blockName) ??
+			[...this.instancedMeshes.entries()]
+				.filter(([key]) => key.startsWith(`${blockName}#`))
+				.flatMap(([, meshes]) => meshes)
+		);
 	}
 }
