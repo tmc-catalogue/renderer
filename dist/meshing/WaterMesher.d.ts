@@ -6,6 +6,8 @@ export interface FluidTextures {
     water?: THREE.DataArrayTexture | null;
     waterFlow?: THREE.DataArrayTexture | null;
     lava?: THREE.DataArrayTexture | null;
+    lavaFlow?: THREE.DataArrayTexture | null;
+    waterOverlay?: THREE.DataArrayTexture | null;
 }
 export interface FluidBuildResult {
     meshes: THREE.Mesh[];

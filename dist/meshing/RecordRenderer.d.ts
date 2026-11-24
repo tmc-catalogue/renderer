@@ -41,6 +41,8 @@ export declare const liquidFrameTextures: {
     water: THREE.DataArrayTexture | null;
     waterFlow: THREE.DataArrayTexture | null;
     lava: THREE.DataArrayTexture | null;
+    lavaFlow: THREE.DataArrayTexture | null;
+    waterOverlay: THREE.DataArrayTexture | null;
 };
 export declare function makePullMaterial(transparent: boolean, quad?: boolean): THREE.ShaderMaterial;
 /** Build the pulling meshes from a record stream. One mesh per category; each mesh gets

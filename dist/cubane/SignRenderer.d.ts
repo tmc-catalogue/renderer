@@ -6,7 +6,12 @@ export declare class SignRenderer {
     private fontPromise;
     private basePixelCache;
     private textureCache;
+    private cacheGeneration;
+    private disposed;
     constructor(assetLoader: AssetLoader);
+    /** Sign pixels, fonts and baked canvases all depend on the active resource pack. */
+    clearCache(): void;
+    dispose(): void;
     /** Whether a block id (e.g. "minecraft:oak_wall_sign") is any kind of sign. */
     isSign(blockName: string): boolean;
     /**
@@ -14,6 +19,8 @@ export declare class SignRenderer {
      * Returns null if the block isn't a sign or the textures can't be loaded.
      */
     buildSignMesh(blockName: string, properties: Record<string, string>, nbtData?: Record<string, any>): Promise<THREE.Object3D | null>;
+    private buildSignMeshForPack;
+    private buildModernSign;
     private detectSign;
     /**
      * Y rotation for a wall sign's board. A wall sign mounts on the block opposite its

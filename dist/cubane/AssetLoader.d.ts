@@ -13,6 +13,8 @@ export declare class AssetLoader {
     private modelCache;
     private textureCache;
     private materialCache;
+    private resourceGeneration;
+    private fluidFramesLoad;
     private textureLoader;
     private textureAtlas;
     private textureUVMap;
@@ -28,6 +30,8 @@ export declare class AssetLoader {
      * Rebuild atlas from ResourcePackManager's packs
      */
     private rebuildFromPackManager;
+    /** Release all assets derived from the previous pack stack. */
+    private invalidatePackAssets;
     /**
      * Hash a string using SHA-256
      */
@@ -63,7 +67,9 @@ export declare class AssetLoader {
     /**
      * Resolve a texture reference in a model
      */
-    resolveTexture(textureRef: string, model: BlockModel): string;
+    resolveTexture(textureRef: string | {
+        sprite?: string;
+    } | unknown, model: BlockModel): string;
     /** Advance animated textures; returns true if any frame flipped (needs redraw). */
     updateAnimations(): boolean;
     getTexture(texturePath: string): Promise<THREE.Texture>;
@@ -71,7 +77,9 @@ export declare class AssetLoader {
     getTint(blockId: string, properties: Record<string, string>, biome?: string, position?: THREE.Vector3): THREE.Color;
     /** True when any animated texture is registered (drives continuous rendering). */
     hasAnimatedTextures(): boolean;
-    private colormapsLoaded;
+    private colormapLoad;
+    private colormapGeneration;
+    private invalidateColormaps;
     /**
      * Load Minecraft's grass/foliage colormaps from the active resource pack and
      * hand them to the TintManager so biome tints come from real colormap pixels.
@@ -103,6 +111,7 @@ export declare class AssetLoader {
     getSharedAtlasTexture(): THREE.Texture | null;
     getMaterial(texturePath: string, options?: {
         transparent?: boolean;
+        lightEmission?: number;
         tint?: THREE.Color;
         isLiquid?: boolean;
         isWater?: boolean;
@@ -124,6 +133,10 @@ export declare class AssetLoader {
      * tile-by-tile from the uvMap rects — tiles stay isolated down to 1px cells.
      */
     private configureAtlasMips;
+    private invalidateFluidFrames;
+    private releaseFluidFrames;
+    /** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
+    private loadFluidFrames;
     buildTextureAtlas(): Promise<THREE.Texture>;
     /**
      * Cache management methods

@@ -4,8 +4,10 @@ import { Block, BlockModel, OptimizedFace } from "./types";
 export declare class BlockMeshBuilder {
     private assetLoader;
     private showUnknownBlocks;
+    private useAtlas;
     constructor(assetLoader: AssetLoader, options?: {
         showUnknownBlocks?: boolean;
+        useAtlas?: boolean;
     });
     createBlockMesh(model: BlockModel, transform?: {
         x?: number;

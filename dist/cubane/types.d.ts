@@ -30,10 +30,11 @@ export interface BlockStateModelHolder {
     uvlock?: boolean;
     weight?: number;
 }
+export type MultipartCondition = {
+    [property: string]: string | number | MultipartCondition[];
+};
 export interface BlockStateMultipart {
-    when?: BlockStateDefinitionVariant<string> | {
-        OR: BlockStateDefinitionVariant<string>[];
-    };
+    when?: MultipartCondition;
     apply: BlockStateModelHolder | BlockStateModelHolder[];
 }
 export interface BlockStateDefinitionVariant<T> {
@@ -46,6 +47,7 @@ export interface BlockModel {
     display?: Record<string, any>;
 }
 export interface BlockModelElement {
+    light_emission?: number;
     from: [number, number, number];
     to: [number, number, number];
     rotation?: {

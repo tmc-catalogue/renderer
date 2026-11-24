@@ -1,7 +1,7 @@
 import * as THREE from "three";
 export type ChestType = "single" | "left" | "right";
 export type ChestFacing = "north" | "east" | "south" | "west";
-export type ChestKind = "normal" | "trapped" | "ender";
+export type ChestKind = "normal" | "trapped" | "ender" | "copper" | "copper_exposed" | "copper_weathered" | "copper_oxidized";
 /**
  * Builds the merged chest BufferGeometry in [0,1]^3 cell space (coords / 16).
  * UV order of operations (design §3):

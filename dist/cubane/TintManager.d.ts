@@ -3,6 +3,7 @@ export declare class TintManager {
     private tintableBlocks;
     private grassColormap;
     private foliageColormap;
+    private dryFoliageColormap;
     constructor();
     isTintable(blockId: string): boolean;
     getTintType(blockId: string): string | null;
@@ -12,7 +13,7 @@ export declare class TintManager {
      * Supply the decoded grass/foliage colormaps (or null to clear). Called by the
      * AssetLoader once textures are available.
      */
-    setColormaps(grass: ImageData | null, foliage: ImageData | null): void;
+    setColormaps(grass: ImageData | null, foliage: ImageData | null, dryFoliage?: ImageData | null): void;
     /**
      * Sample a Minecraft colormap at the biome's climate point. The colormaps are
      * a triangular gradient indexed by adjusted temperature/downfall. Returns the

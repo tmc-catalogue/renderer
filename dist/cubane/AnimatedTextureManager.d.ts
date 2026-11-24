@@ -10,9 +10,13 @@ import { TextureAnimationMetadata } from "./types";
 export declare class AnimatedTextureManager {
     private assetLoader;
     private animatedTextures;
+    private generation;
+    private pendingImages;
     constructor(assetLoader: AssetLoader);
     /** True when at least one animated texture is registered (drives continuous rendering). */
     hasActiveTextures(): boolean;
+    /** Stop old animations and return their textures to the owner's disposal pass. */
+    clear(): THREE.Texture[];
     /**
      * Check if a texture has animation metadata
      */

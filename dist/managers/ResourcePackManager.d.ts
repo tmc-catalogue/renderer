@@ -170,7 +170,12 @@ export declare class ResourcePackManager {
     /**
      * Manually trigger atlas rebuild
      */
+    private _rebuildDebounce;
+    private _rebuildChain;
+    private _lastRebuildKey;
+    private _rebuildKey;
     rebuildPackAtlas(): Promise<void>;
+    private _doRebuildPackAtlas;
     private triggerRebuild;
     /**
      * Save pack state to IndexedDB (already automatic)
