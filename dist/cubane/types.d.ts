@@ -13,7 +13,10 @@ export interface Block {
 export interface TextureAnimationMetadata {
     animation: {
         frametime?: number;
-        frames?: number[];
+        frames?: (number | {
+            index: number;
+            time?: number;
+        })[];
         interpolate?: boolean;
         width?: number;
         height?: number;

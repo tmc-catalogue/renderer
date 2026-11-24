@@ -3041,9 +3041,10 @@ export class SchematicObject extends EventEmitter {
 		const updates = blocks.map(
 			([point, state]) =>
 				[
-					Array.isArray(point)
+					(Array.isArray(point)
 						? new THREE.Vector3(...(point as [number, number, number]))
-						: point.clone(),
+						: point.clone()
+					).roundToZero(),
 					state,
 				] as const
 		);
@@ -3080,15 +3081,28 @@ export class SchematicObject extends EventEmitter {
 					this.getPalettes(this.schematicWrapper).default,
 					true
 				);
-				const chunks = new Set(
-					positions.map((p) => {
-						const c = this.getChunkCoordinates(p);
-						return `${c.x},${c.y},${c.z}`;
-					})
-				);
-				for (const key of chunks) {
-					const [x, y, z] = key.split(",").map(Number);
-					await this.rebuildChunkNow(x, y, z);
+				const { chunkWidth, chunkHeight, chunkLength } = this.chunkDimensions;
+				const chunks = new Map<string, [number, number, number]>();
+				const addChunk = (x: number, y: number, z: number) => {
+					const key = `${x},${y},${z}`;
+					if (!chunks.has(key)) chunks.set(key, [x, y, z]);
+				};
+				for (const position of positions) {
+					const { x, y, z } = this.getChunkCoordinates(position);
+					addChunk(x, y, z);
+					const localX = position.x - x * chunkWidth;
+					const localY = position.y - y * chunkHeight;
+					const localZ = position.z - z * chunkLength;
+					// A seam edit can expose or hide the face in the adjacent chunk.
+					if (localX === 0) addChunk(x - 1, y, z);
+					if (localX === chunkWidth - 1) addChunk(x + 1, y, z);
+					if (localY === 0) addChunk(x, y - 1, z);
+					if (localY === chunkHeight - 1) addChunk(x, y + 1, z);
+					if (localZ === 0) addChunk(x, y, z - 1);
+					if (localZ === chunkLength - 1) addChunk(x, y, z + 1);
+				}
+				for (const chunk of chunks.values()) {
+					await this.rebuildChunkNow(...chunk);
 				}
 			});
 			if (await this.touchesFluid(positions)) await this.refreshFluidSurface();
@@ -3324,6 +3338,31 @@ export class SchematicObject extends EventEmitter {
 		});
 	}
 
+	private readChunkApron(x: number, y: number, z: number): Int32Array | undefined {
+		const { chunkWidth: width, chunkHeight: height, chunkLength: length } = this.chunkDimensions;
+		const wrapper = this.schematicWrapper;
+		// Read just the six one-block-thick faces. Edges and corners cannot occlude a face.
+		const planes = [
+			wrapper.get_chunk_blocks_indices(x - 1, y, z, 1, height, length),
+			wrapper.get_chunk_blocks_indices(x + width, y, z, 1, height, length),
+			wrapper.get_chunk_blocks_indices(x, y - 1, z, width, 1, length),
+			wrapper.get_chunk_blocks_indices(x, y + height, z, width, 1, length),
+			wrapper.get_chunk_blocks_indices(x, y, z - 1, width, height, 1),
+			wrapper.get_chunk_blocks_indices(x, y, z + length, width, height, 1),
+		];
+		const blockCount = planes.reduce((count, plane) => count + plane.length, 0);
+		if (!blockCount) return;
+		const apron = new Int32Array(blockCount * 4);
+		let offset = 0;
+		for (const plane of planes) {
+			for (const block of plane) {
+				apron.set(block, offset);
+				offset += 4;
+			}
+		}
+		return apron;
+	}
+
 	private async rebuildChunkNow(chunkX: number, chunkY: number, chunkZ: number) {
 		const chunkOffset = {
 			x: chunkX * this.chunkDimensions.chunkWidth,
@@ -3381,9 +3420,10 @@ export class SchematicObject extends EventEmitter {
 			);
 		}
 
-		// Remove old chunk objects from the scene
-		this.removeChunkObjects(chunkX, chunkY, chunkZ);
-
+		if (!blocks.length) {
+			this.removeChunkObjects(chunkX, chunkY, chunkZ);
+			return;
+		}
 		// Build new chunk objects using the optimized format
 		const newChunkObjects = await this.worldMeshBuilder.getChunkMesh(
 			{
@@ -3391,6 +3431,7 @@ export class SchematicObject extends EventEmitter {
 				chunk_x: chunkX,
 				chunk_y: chunkY,
 				chunk_z: chunkZ,
+				apronBlocks: this.readChunkApron(chunkOffset.x, chunkOffset.y, chunkOffset.z),
 			},
 			this,
 			this.renderingBounds,
@@ -3399,6 +3440,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Apply properties to the new objects
 		this.applyPropertiesToObjects(newChunkObjects);
+		this.removeChunkObjects(chunkX, chunkY, chunkZ);
 
 		newChunkObjects.forEach((obj) => {
 			this.group.add(obj);

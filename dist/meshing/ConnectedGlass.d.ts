@@ -18,7 +18,7 @@ export declare function hiddenGlassFace(face: SurfaceFace, neighbors: SurfaceFac
 export declare function glassConnections(face: SurfaceFace, state: string, x: number, y: number, z: number, getBlock: GetBlock, templates: ReadonlyMap<string, SurfaceFace[]>, names?: ReadonlyMap<string, string>): number[];
 export declare function makeGlassMaterial(map: THREE.Texture, connected: boolean, clip?: {
     value: THREE.Vector2;
-}): THREE.MeshBasicMaterial;
+}, source?: THREE.Material): THREE.MeshBasicMaterial;
 /** Called once per occupied section. Work scales with surface cells, not bounds. */
 export declare function buildGlassMeshes(getBlock: GetBlock, cells: Iterable<SurfaceCell>, templates: ReadonlyMap<string, SurfaceFace[]>, materials: ReadonlyMap<string, THREE.Material>): THREE.Mesh[];
 //# sourceMappingURL=ConnectedGlass.d.ts.map

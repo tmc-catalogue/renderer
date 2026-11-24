@@ -64,9 +64,13 @@ export class WorldMeshBuilder {
 	// the workers (one WASM MeshBuilder per id). Single-instance use is unaffected.
 	private static nextMeshContextId = 0;
 	private readonly meshContextId = `mctx-${WorldMeshBuilder.nextMeshContextId++}`;
+	private nextWorkerRequest = 0;
 	private workers: Worker[] = [];
 	private freeWorkers: Worker[] = [];
 	private workerQueue: ((worker: Worker) => void)[] = []; // Queue for waiting tasks
+	private readonly leasedWorkers = new Set<Worker>();
+	private readonly workerWaiters = new Map<(worker: Worker) => void, (reason: Error) => void>();
+	private disposed = false;
 	private pendingRequests = new Map<
 		string,
 		{ resolve: (value: any) => void; reject: (reason?: any) => void; worker: Worker }
@@ -142,14 +146,20 @@ export class WorldMeshBuilder {
 
 			// Check if WebGPU is available
 			const isAvailable = await GPUCapabilityManager.isWebGPUAvailable();
+			if (this.disposed) return false;
 			if (!isAvailable) {
 				this.initializeWorkers();
 				return false;
 			}
 
 			// Initialize compute mesh builder
-			this.computeMeshBuilder = new ComputeMeshBuilder();
-			const success = await this.computeMeshBuilder.initialize();
+			const builder = new ComputeMeshBuilder();
+			this.computeMeshBuilder = builder;
+			const success = await builder.initialize();
+			if (this.disposed) {
+				builder.dispose();
+				return false;
+			}
 
 			if (success) {
 				this.useGPUCompute = true;
@@ -164,6 +174,7 @@ export class WorldMeshBuilder {
 				return false;
 			}
 		} catch (error) {
+			if (this.disposed) return false;
 			console.warn("[WorldMeshBuilder] GPU compute error, using worker fallback:", error);
 			this.computeMeshBuilder = null;
 			this.initializeWorkers();
@@ -179,7 +190,7 @@ export class WorldMeshBuilder {
 	}
 
 	private initializeWorkers() {
-		if (this.workers.length > 0) return;
+		if (this.disposed || this.workers.length > 0) return;
 
 		// Initialize shared memory pool for zero-copy transfers
 		this.sharedMemoryPool = getSharedMemoryPool();
@@ -204,7 +215,6 @@ export class WorldMeshBuilder {
 			const worker = this.useWasmMeshBuilder
 				? new MeshBuilderWasmWorker()
 				: new MeshBuilderWorker();
-			worker.onmessage = (event: MessageEvent) => this.handleWorkerMessage(worker, event);
 			this.workers.push(worker);
 			this.freeWorkers.push(worker);
 		}
@@ -242,7 +252,11 @@ export class WorldMeshBuilder {
 
 		// Notify all workers
 		for (const worker of this.workers) {
-			worker.postMessage({ type: "setGreedyMeshing", enabled: false });
+			worker.postMessage({
+				type: "setGreedyMeshing",
+				enabled: false,
+				meshContextId: this.meshContextId,
+			});
 		}
 	}
 
@@ -275,11 +289,14 @@ export class WorldMeshBuilder {
 	// Batch mode state
 	private batchPendingChunks: Map<string, { resolve: () => void; reject: (err: any) => void }> =
 		new Map();
-	private batchFinishResolve: ((data: any) => void) | null = null;
-	private _batchFinishReject: ((err: any) => void) | null = null;
+	private batchFinishRequests = new Map<
+		string,
+		{ resolve: (data: any) => void; reject: (error: Error) => void }
+	>();
 
 	private handleWorkerMessage(worker: Worker, event: MessageEvent) {
-		const { type, chunkId, error, timings, ...data } = event.data;
+		const { type, meshContextId, chunkId, error, timings, ...data } = event.data;
+		if (meshContextId !== this.meshContextId) return;
 
 		if (type === "chunkBuilt") {
 			if (timings) {
@@ -298,7 +315,7 @@ export class WorldMeshBuilder {
 			}
 
 			const request = this.pendingRequests.get(chunkId);
-			if (request) {
+			if (request?.worker === worker) {
 				request.resolve(data);
 				this.pendingRequests.delete(chunkId);
 
@@ -312,36 +329,36 @@ export class WorldMeshBuilder {
 			// onmessage, misrouting this build's remaining responses (deadlock at 0/N).
 			const request = this.batchPendingChunks.get(chunkId);
 			if (request) {
-				this.sharedMemoryPool?.releaseBuffers(chunkId);
 				request.resolve();
 				this.batchPendingChunks.delete(chunkId);
 			}
 		} else if (type === "batchFinished") {
 			// Batch mode complete - return accumulated meshes
-			if (this.batchFinishResolve) {
-				this.batchFinishResolve(data);
-				this.batchFinishResolve = null;
-				this._batchFinishReject = null;
+			const request = this.batchFinishRequests.get(chunkId);
+			if (request) {
+				this.batchFinishRequests.delete(chunkId);
+				request.resolve(data);
 			}
 		} else if (type === "error") {
+			const finishRequest = this.batchFinishRequests.get(chunkId);
+			if (finishRequest) {
+				this.batchFinishRequests.delete(chunkId);
+				finishRequest.reject(new Error(error));
+				return;
+			}
 			if (chunkId) {
 				const batchRequest = this.batchPendingChunks.get(chunkId);
 				if (batchRequest) {
-					this.sharedMemoryPool?.releaseBuffers(chunkId);
 					this.batchPendingChunks.delete(chunkId);
 					batchRequest.reject(new Error(error));
 					return;
 				}
 				const request = this.pendingRequests.get(chunkId);
-				if (request) {
+				if (request?.worker === worker) {
 					request.reject(new Error(error));
 					this.pendingRequests.delete(chunkId);
 					this.returnWorker(worker);
 				}
-			} else if (this._batchFinishReject) {
-				this._batchFinishReject(new Error(error));
-				this._batchFinishReject = null;
-				this.batchFinishResolve = null;
 			} else {
 				console.error("[WorldMeshBuilder] Worker error:", error);
 			}
@@ -351,14 +368,19 @@ export class WorldMeshBuilder {
 	}
 
 	private returnWorker(worker: Worker) {
-		if (!this.workers.includes(worker)) return; // Worker might have been terminated
+		if (!this.leasedWorkers.delete(worker)) return;
 
 		if (this.workerQueue.length > 0) {
 			const resolve = this.workerQueue.shift()!;
 			resolve(worker);
 		} else {
+			worker.onmessage = null;
 			this.freeWorkers.push(worker);
 		}
+	}
+
+	private newWorkerRequestId(): string {
+		return `${this.meshContextId}:${this.nextWorkerRequest++}`;
 	}
 
 	public setChunkSize(newChunkSize: number): void {
@@ -442,19 +464,23 @@ export class WorldMeshBuilder {
 	public invalidateCache(): void {
 		console.log("[WorldMeshBuilder] Invalidating cache");
 		if (this.paletteCache) {
-			this.paletteCache.blockData.forEach((blockData) => {
-				blockData.materialGroups.forEach((group) => {
-					MaterialRegistry.releaseMaterial(group.material);
-					if (group.baseGeometry) {
-						group.baseGeometry.dispose();
-					}
-				});
-			});
+			this.releasePaletteBlocks(this.paletteCache.blockData);
 			this.paletteCache = null;
 		}
 	}
 
+	private releasePaletteBlocks(blocks: PaletteBlockData[]): void {
+		for (const block of blocks) {
+			if (!block) continue;
+			for (const group of block.materialGroups) {
+				MaterialRegistry.releaseMaterial(group.material);
+				group.baseGeometry?.dispose();
+			}
+		}
+	}
+
 	public async precomputePaletteGeometries(palette: any[], fluidSurface = false): Promise<void> {
+		if (this.disposed) throw new Error("Mesh builder disposed");
 		performanceMonitor.startOperation("precomputePaletteGeometries");
 
 		// Check if palette is effectively the same
@@ -496,6 +522,7 @@ export class WorldMeshBuilder {
 			// Only initialize workers if GPU is not being used
 			this.initializeWorkers();
 		}
+		if (this.disposed) throw new Error("Mesh builder disposed");
 
 		const paletteBlockData: PaletteBlockData[] = new Array(palette.length);
 		const globalMaterialMap = new Map<string, number>();
@@ -524,6 +551,7 @@ export class WorldMeshBuilder {
 			try {
 				// Get geometry from Cubane (Main Thread)
 				const cubaneObj = await this.cubane.getBlockMesh(blockString, biome, true);
+				if (this.disposed) return;
 				const extractedGeometries = cubaneObj
 					? this.extractAllMeshData(cubaneObj)
 					: this.extractAllMeshData(this.createFallbackObject3D(blockString));
@@ -660,7 +688,7 @@ export class WorldMeshBuilder {
 		};
 
 		// Process with concurrency limit
-		while (currentIndex < palette.length || workerPromises.length > 0) {
+		while (!this.disposed && (currentIndex < palette.length || workerPromises.length > 0)) {
 			while (workerPromises.length < CONCURRENCY_LIMIT && currentIndex < palette.length) {
 				const index = currentIndex++;
 				const promise = processBlock(index).then(() => {
@@ -675,6 +703,10 @@ export class WorldMeshBuilder {
 			} else if (currentIndex >= palette.length) {
 				break;
 			}
+		}
+		if (this.disposed) {
+			this.releasePaletteBlocks(paletteBlockData);
+			throw new Error("Mesh builder disposed");
 		}
 
 		this.paletteUsesFluidSurface = fluidSurface;
@@ -752,7 +784,9 @@ export class WorldMeshBuilder {
 	// shared pool, responses route back to the builder that borrowed the worker
 	// (workers are lent exclusively until returnWorker).
 	private async getFreeWorker(): Promise<Worker> {
+		if (this.disposed) throw new Error("Mesh builder disposed");
 		const bind = (worker: Worker): Worker => {
+			this.leasedWorkers.add(worker);
 			worker.onmessage = (event: MessageEvent) => this.handleWorkerMessage(worker, event);
 			return worker;
 		};
@@ -760,8 +794,78 @@ export class WorldMeshBuilder {
 			return bind(this.freeWorkers.pop()!);
 		}
 		// Wait for a worker to become free
-		return new Promise<Worker>((resolve) => {
-			this.workerQueue.push((worker) => resolve(bind(worker)));
+		return new Promise<Worker>((resolve, reject) => {
+			const acquire = (worker: Worker) => {
+				this.workerWaiters.delete(acquire);
+				resolve(bind(worker));
+			};
+			this.workerWaiters.set(acquire, reject);
+			this.workerQueue.push(acquire);
+		});
+	}
+
+	private async buildChunkWithWorker(
+		chunkId: string,
+		blocks: Int32Array | number[][],
+		chunkOrigin: [number, number, number],
+		apronBlocks?: Int32Array
+	): Promise<{ meshes: any[]; origin: number[] }> {
+		if (!blocks.length) return { meshes: [], origin: chunkOrigin };
+		this.initializeWorkers();
+		const startedAt = performance.now();
+		const worker = await this.getFreeWorker();
+		if (this.disposed) throw new Error("Mesh builder disposed");
+		const waitTime = performance.now() - startedAt;
+		if (waitTime > 10) {
+			console.warn(
+				`[WorkerPool] getFreeWorker took ${waitTime.toFixed(0)}ms (free: ${this.freeWorkers.length}/${this.workers.length}, queue: ${this.workerQueue.length})`
+			);
+		}
+		return new Promise((resolve, reject) => {
+			const requestId = this.newWorkerRequestId();
+			const flat = blocks instanceof Int32Array ? blocks : null;
+			const input = this.useSharedMemory && flat ? this.sharedMemoryPool : null;
+			const timeout = setTimeout(() => {
+				this.pendingRequests.delete(requestId);
+				input?.releaseBuffers(requestId);
+				this.returnWorker(worker);
+				reject(new Error(`Chunk build timeout for ${chunkId}`));
+			}, 30000);
+			const cleanup = () => {
+				clearTimeout(timeout);
+				input?.releaseBuffers(requestId);
+			};
+			this.pendingRequests.set(requestId, {
+				resolve: (result) => {
+					cleanup();
+					resolve(result);
+				},
+				reject: (error) => {
+					cleanup();
+					reject(error);
+				},
+				worker,
+			});
+			const message = {
+				type: "buildChunk",
+				chunkId: requestId,
+				chunkOrigin,
+				apronBlocks,
+				meshContextId: this.meshContextId,
+			};
+			try {
+				if (input && flat) {
+					const sharedInputBuffer = input.writeChunkInput(requestId, flat, ...chunkOrigin);
+					worker.postMessage({ ...message, sharedInputBuffer });
+				} else {
+					worker.postMessage({ ...message, blocks }, flat ? [flat.buffer] : []);
+				}
+			} catch (error) {
+				this.pendingRequests.delete(requestId);
+				cleanup();
+				this.returnWorker(worker);
+				reject(error);
+			}
 		});
 	}
 
@@ -811,6 +915,7 @@ export class WorldMeshBuilder {
 		const batchWorker = await this.getFreeWorker();
 		try {
 			for (let subBatchIdx = 0; subBatchIdx < numSubBatches; subBatchIdx++) {
+				if (this.disposed) throw new Error("Mesh builder disposed");
 				const subBatchStart = subBatchIdx * SUB_BATCH_SIZE;
 				const subBatchEnd = Math.min(subBatchStart + SUB_BATCH_SIZE, totalChunks);
 				const subBatchChunks = allChunks.slice(subBatchStart, subBatchEnd);
@@ -820,7 +925,8 @@ export class WorldMeshBuilder {
 
 				// Process this sub-batch's chunks through the batch worker
 				for (const chunkData of subBatchChunks) {
-					const chunkId = `batch_${chunkData.chunk_x}_${chunkData.chunk_y}_${chunkData.chunk_z}`;
+					if (this.disposed) throw new Error("Mesh builder disposed");
+					const requestId = this.newWorkerRequestId();
 
 					// Convert blocks to Int32Array if needed
 					let blocksArray: Int32Array;
@@ -852,51 +958,56 @@ export class WorldMeshBuilder {
 
 					// Wait for chunk to be accumulated
 					await new Promise<void>((resolve, reject) => {
+						const input = this.useSharedMemory ? this.sharedMemoryPool : null;
 						const timer = setTimeout(() => {
-							this.batchPendingChunks.delete(chunkId);
-							this.sharedMemoryPool?.releaseBuffers(chunkId);
-							reject(new Error(`Batched chunk build timeout for ${chunkId}`));
+							this.batchPendingChunks.delete(requestId);
+							input?.releaseBuffers(requestId);
+							reject(
+								new Error(
+									`Batched chunk build timeout for ${chunkData.chunk_x},${chunkData.chunk_y},${chunkData.chunk_z}`
+								)
+							);
 						}, 30000);
-						this.batchPendingChunks.set(chunkId, {
+						const cleanup = () => {
+							clearTimeout(timer);
+							input?.releaseBuffers(requestId);
+						};
+						this.batchPendingChunks.set(requestId, {
 							resolve: () => {
-								clearTimeout(timer);
+								cleanup();
 								resolve();
 							},
 							reject: (err) => {
-								clearTimeout(timer);
+								cleanup();
 								reject(err);
 							},
 						});
 
 						// Use SharedArrayBuffer if available
-						if (this.useSharedMemory && this.sharedMemoryPool) {
-							const sharedBuffer = this.sharedMemoryPool.writeChunkInput(
-								chunkId,
-								blocksArray,
-								originX,
-								originY,
-								originZ
-							);
-							batchWorker.postMessage({
-								type: "buildChunkBatched",
-								chunkId,
-								sharedInputBuffer: sharedBuffer,
-								chunkOrigin: [originX, originY, originZ],
-								apronBlocks: chunkData.apronBlocks, // occlusion-only neighbour shell
-								meshContextId: this.meshContextId,
-							});
-						} else {
-							batchWorker.postMessage(
-								{
-									type: "buildChunkBatched",
-									chunkId,
-									blocks: blocksArray,
-									chunkOrigin: [originX, originY, originZ],
-									apronBlocks: chunkData.apronBlocks, // occlusion-only neighbour shell
-									meshContextId: this.meshContextId,
-								},
-								[blocksArray.buffer]
-							);
+						const message = {
+							type: "buildChunkBatched",
+							chunkId: requestId,
+							chunkOrigin: [originX, originY, originZ],
+							apronBlocks: chunkData.apronBlocks, // occlusion-only neighbour shell
+							meshContextId: this.meshContextId,
+						};
+						try {
+							if (input) {
+								const sharedInputBuffer = input.writeChunkInput(
+									requestId,
+									blocksArray,
+									originX,
+									originY,
+									originZ
+								);
+								batchWorker.postMessage({ ...message, sharedInputBuffer });
+							} else {
+								batchWorker.postMessage({ ...message, blocks: blocksArray }, [blocksArray.buffer]);
+							}
+						} catch (error) {
+							this.batchPendingChunks.delete(requestId);
+							cleanup();
+							reject(error);
 						}
 					});
 
@@ -907,24 +1018,38 @@ export class WorldMeshBuilder {
 				}
 
 				// Finish this sub-batch and get merged results
+				if (this.disposed) throw new Error("Mesh builder disposed");
+				const finishId = this.newWorkerRequestId();
 				const batchResult = await new Promise<any>((resolve, reject) => {
 					const timer = setTimeout(() => {
-						this.batchFinishResolve = null;
-						this._batchFinishReject = null;
+						this.batchFinishRequests.delete(finishId);
 						reject(new Error("Batched mesh finalization timeout"));
 					}, 30000);
-					this.batchFinishResolve = (data) => {
+					this.batchFinishRequests.set(finishId, {
+						resolve: (data) => {
+							clearTimeout(timer);
+							resolve(data);
+						},
+						reject: (error) => {
+							clearTimeout(timer);
+							reject(error);
+						},
+					});
+					try {
+						batchWorker.postMessage({
+							type: "finishBatch",
+							chunkId: finishId,
+							meshContextId: this.meshContextId,
+						});
+					} catch (error) {
+						this.batchFinishRequests.delete(finishId);
 						clearTimeout(timer);
-						resolve(data);
-					};
-					this._batchFinishReject = (err) => {
-						clearTimeout(timer);
-						reject(err);
-					};
-					batchWorker.postMessage({ type: "finishBatch", meshContextId: this.meshContextId });
+						reject(error);
+					}
 				});
 
 				// Create Three.js meshes from this sub-batch's merged data
+				if (this.disposed) throw new Error("Mesh builder disposed");
 				const subBatchMeshes = this.createMeshesFromBatchResult(batchResult);
 				allResultMeshes.push(...subBatchMeshes);
 
@@ -940,6 +1065,9 @@ export class WorldMeshBuilder {
 			}
 
 			return allResultMeshes;
+		} catch (error) {
+			allResultMeshes.forEach((mesh) => mesh.geometry.dispose());
+			throw error;
 		} finally {
 			// Release the batch worker back to the (possibly shared) pool.
 			this.returnWorker(batchWorker);
@@ -1243,96 +1371,12 @@ export class WorldMeshBuilder {
 			}
 		}
 
-		// Worker fallback path
-		const workerBlocks = blocksToProcess;
-
-		const workerPromise = new Promise<any>(async (resolve, reject) => {
-			if (workerBlocks.length === 0) {
-				resolve({ meshes: [] });
-				return;
-			}
-
-			// Ensure workers exist
-			if (this.workers.length === 0) {
-				this.initializeWorkers();
-			}
-
-			// Get a free worker
-			const worker = await this.getFreeWorker();
-
-			// Add timeout to prevent hanging
-			const timeoutId = setTimeout(() => {
-				if (this.pendingRequests.has(chunkId)) {
-					const req = this.pendingRequests.get(chunkId);
-					this.pendingRequests.delete(chunkId);
-					// Release worker even on timeout
-					if (req) {
-						this.returnWorker(req.worker);
-					}
-					reject(new Error(`Chunk build timeout for ${chunkId}`));
-				}
-			}, 30000); // 30 seconds timeout
-
-			this.pendingRequests.set(chunkId, {
-				resolve: (data) => {
-					clearTimeout(timeoutId);
-					// Clean up shared memory buffer if used
-					if (this.sharedMemoryPool) {
-						this.sharedMemoryPool.releaseBuffers(chunkId);
-					}
-					resolve(data);
-				},
-				reject: (err) => {
-					clearTimeout(timeoutId);
-					// Clean up shared memory buffer if used
-					if (this.sharedMemoryPool) {
-						this.sharedMemoryPool.releaseBuffers(chunkId);
-					}
-					reject(err);
-				},
-				worker: worker,
-			});
-
-			// Use SharedArrayBuffer for zero-copy transfer if available
-			if (this.useSharedMemory && this.sharedMemoryPool && workerBlocks instanceof Int32Array) {
-				// Write data to shared memory - worker reads directly, no copy!
-				const sharedBuffer = this.sharedMemoryPool.writeChunkInput(
-					chunkId,
-					workerBlocks,
-					originX,
-					originY,
-					originZ
-				);
-
-				worker.postMessage({
-					type: "buildChunk",
-					chunkId,
-					sharedInputBuffer: sharedBuffer, // Worker reads from this directly
-					chunkOrigin: [originX, originY, originZ],
-					meshContextId: this.meshContextId,
-				});
-			} else {
-				// Fallback: transfer via postMessage (copies data)
-				const transferList: Transferable[] = [];
-				if (workerBlocks instanceof Int32Array) {
-					transferList.push(workerBlocks.buffer);
-				}
-
-				worker.postMessage(
-					{
-						type: "buildChunk",
-						chunkId,
-						blocks: workerBlocks,
-						chunkOrigin: [originX, originY, originZ],
-						meshContextId: this.meshContextId,
-					},
-					transferList
-				);
-			}
-		});
-
 		try {
-			const workerResult = await workerPromise;
+			const workerResult = await this.buildChunkWithWorker(chunkId, blocksToProcess, [
+				originX,
+				originY,
+				originZ,
+			]);
 			return {
 				geometries: workerResult.meshes as ChunkGeometryData[],
 				origin: workerResult.origin || [originX, originY, originZ],
@@ -1655,110 +1699,13 @@ export class WorldMeshBuilder {
 			}
 		}
 
-		// Worker fallback path
 		if (!buildResult) {
-			const workerPromise = new Promise<any>(async (resolve, reject) => {
-				if (workerBlocks.length === 0) {
-					resolve({ meshes: [] });
-					return;
-				}
-
-				// Ensure workers exist
-				if (this.workers.length === 0) {
-					this.initializeWorkers();
-				}
-
-				// TIMING: Measure getFreeWorker wait time
-				const getFreeWorkerStart = performance.now();
-
-				// Get a free worker
-				const worker = await this.getFreeWorker();
-
-				const getFreeWorkerTime = performance.now() - getFreeWorkerStart;
-				if (getFreeWorkerTime > 10) {
-					console.warn(
-						`[WorkerPool] getFreeWorker took ${getFreeWorkerTime.toFixed(0)}ms (free: ${this.freeWorkers.length}/${this.workers.length}, queue: ${this.workerQueue.length})`
-					);
-				}
-
-				// Add timeout to prevent hanging
-				const timeoutId = setTimeout(() => {
-					if (this.pendingRequests.has(chunkId)) {
-						const req = this.pendingRequests.get(chunkId);
-						this.pendingRequests.delete(chunkId);
-						// Release worker even on timeout
-						if (req) {
-							this.returnWorker(req.worker);
-						}
-						reject(new Error(`Chunk build timeout for ${chunkId}`));
-					}
-				}, 30000); // 30 seconds timeout
-
-				this.pendingRequests.set(chunkId, {
-					resolve: (data) => {
-						clearTimeout(timeoutId);
-						// Clean up shared memory buffer if used
-						if (this.sharedMemoryPool) {
-							this.sharedMemoryPool.releaseBuffers(chunkId);
-						}
-						resolve(data);
-					},
-					reject: (err) => {
-						clearTimeout(timeoutId);
-						// Clean up shared memory buffer if used
-						if (this.sharedMemoryPool) {
-							this.sharedMemoryPool.releaseBuffers(chunkId);
-						}
-						reject(err);
-					},
-					worker: worker,
-				});
-
-				// TIMING: Record when we send the message
-				const sendTime = performance.now();
-
-				// Use SharedArrayBuffer for zero-copy transfer if available
-				if (this.useSharedMemory && this.sharedMemoryPool && workerBlocks instanceof Int32Array) {
-					// Write data to shared memory - worker reads directly, no copy!
-					const sharedBuffer = this.sharedMemoryPool.writeChunkInput(
-						chunkId,
-						workerBlocks,
-						originX,
-						originY,
-						originZ
-					);
-
-					worker.postMessage({
-						type: "buildChunk",
-						chunkId,
-						sharedInputBuffer: sharedBuffer,
-						chunkOrigin: [originX, originY, originZ],
-						apronBlocks, // occlusion-only neighbour shell, filtered to the same visible cells
-						meshContextId: this.meshContextId,
-						_sendTime: sendTime, // Pass timestamp for round-trip measurement
-					});
-				} else {
-					// Fallback: transfer via postMessage (copies data)
-					const transferList: Transferable[] = [];
-					if (workerBlocks instanceof Int32Array) {
-						transferList.push(workerBlocks.buffer);
-					}
-
-					worker.postMessage(
-						{
-							type: "buildChunk",
-							chunkId,
-							blocks: workerBlocks,
-							chunkOrigin: [originX, originY, originZ],
-							apronBlocks, // occlusion-only neighbour shell, filtered to the same visible cells
-							meshContextId: this.meshContextId,
-						},
-						transferList
-					);
-				}
-			});
-
-			buildResult = await workerPromise;
+			buildResult = await this.buildChunkWithWorker(
+				chunkId,
+				workerBlocks,
+				[originX, originY, originZ],
+				apronBlocks
+			);
 		}
 		timings.workerDispatch = performance.now() - timingStart;
 		timingStart = performance.now();
@@ -2112,34 +2059,25 @@ export class WorldMeshBuilder {
 	}
 
 	public dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const disposed = new Error("Mesh builder disposed");
+		// Remove only this builder's waiters from the shared queue.
+		for (const [acquire, reject] of this.workerWaiters) {
+			const index = this.workerQueue.indexOf(acquire);
+			if (index >= 0) this.workerQueue.splice(index, 1);
+			reject(disposed);
+		}
+		this.workerWaiters.clear();
 		// Reject any pending requests before destroying workers
-		this.pendingRequests.forEach((request, chunkId) => {
-			request.reject(new Error(`Worker terminated before processing chunk ${chunkId}`));
-		});
+		this.pendingRequests.forEach((request) => request.reject(disposed));
 		this.pendingRequests.clear();
-		for (const [id, request] of this.batchPendingChunks) {
-			request.reject(new Error(`Worker terminated before processing batched chunk ${id}`));
-			this.sharedMemoryPool?.releaseBuffers(id);
-		}
+		for (const request of this.batchPendingChunks.values()) request.reject(disposed);
 		this.batchPendingChunks.clear();
-		this._batchFinishReject?.(new Error("Mesh builder disposed"));
-		this._batchFinishReject = null;
-		this.batchFinishResolve = null;
+		for (const request of this.batchFinishRequests.values()) request.reject(disposed);
+		this.batchFinishRequests.clear();
 
-		// Clear worker queue
-		this.workerQueue = [];
-
-		if (this.paletteCache) {
-			this.paletteCache.blockData.forEach((blockData) => {
-				blockData.materialGroups.forEach((group) => {
-					MaterialRegistry.releaseMaterial(group.material);
-					if (group.baseGeometry) {
-						group.baseGeometry.dispose();
-					}
-				});
-			});
-			this.paletteCache = null;
-		}
+		if (this.paletteCache) this.invalidateCache();
 
 		// Dispose GPU compute resources
 		if (this.computeMeshBuilder) {
@@ -2155,12 +2093,17 @@ export class WorldMeshBuilder {
 		if (!this.schematicRenderer.options.context || !this.useWasmMeshBuilder) {
 			this.workers.forEach((w) => w.terminate());
 		} else {
+			// Run context cleanup after earlier messages and before handing the
+			// worker to a sibling. Replies already in flight are context-tagged.
 			this.workers.forEach((w) =>
 				w.postMessage({ type: "disposeContext", meshContextId: this.meshContextId })
 			);
+			for (const worker of this.leasedWorkers) this.returnWorker(worker);
 		}
+		this.leasedWorkers.clear();
 		this.workers = [];
 		this.freeWorkers = [];
+		this.workerQueue = [];
 
 		console.log("[WorldMeshBuilder] Disposed palette cache, GPU compute, and workers.");
 		console.log("[WorldMeshBuilder] dispose() called from:", new Error().stack);

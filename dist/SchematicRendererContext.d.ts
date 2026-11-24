@@ -66,6 +66,7 @@ export declare class SchematicRendererContext {
     /** Register a renderer so pack changes can invalidate it. */
     attachRenderer(renderer: {
         invalidate(): void;
+        refreshResourceAssets?(): Promise<void>;
     }): void;
     /** Unregister a renderer (call on the renderer's dispose). */
     detachRenderer(renderer: {

@@ -7,6 +7,7 @@ import type { BlockData } from "../types";
 import type { ExportOptions, ExportResult } from "../types/export";
 import { EditableRegionHighlight } from "./highlight/EditableRegionHighlight";
 export declare class SchematicObject extends EventEmitter {
+    private static readonly builderQueues;
     name: string;
     schematicWrapper: SchematicWrapper;
     private schematicRenderer;
@@ -21,6 +22,12 @@ export declare class SchematicObject extends EventEmitter {
     private animatedSurfaces;
     private surfaceViewBox;
     private editQueue;
+    private materialStates;
+    private materialCopies;
+    private ownedMaterialCopies;
+    private hasBuiltMeshes;
+    private visibilityBuildPending;
+    private disposed;
     get hasAnimatedSurfaces(): boolean;
     hasSurfacesInView(frustum: THREE.Frustum): boolean;
     hasParticlesInView(frustum: THREE.Frustum): boolean;
@@ -141,6 +148,9 @@ export declare class SchematicObject extends EventEmitter {
         animations?: THREE.AnimationClip[];
     }): Promise<void>;
     private buildMeshes;
+    /** Workers and palette tables belong to a renderer, not a schematic. Keep
+     * different palettes from changing the worker's active template mid-build. */
+    private withBuilder;
     private reportBuildProgress;
     buildSchematicMeshes(schematicObject: SchematicObject, chunkDimensions?: any, buildMode?: MeshBuildingMode): Promise<{
         meshes: any[];
@@ -211,6 +221,8 @@ export declare class SchematicObject extends EventEmitter {
     private buildTransparentSurfaces;
     private refreshSurfaceCells;
     private isSurfaceOnlyState;
+    private touchesFluid;
+    private refreshFluidSurface;
     /** One shared surface pass for both the GPU-pull and batched CPU paths. */
     private buildFluidSurface;
     /** Shared front half of the GPU build paths: palette precompute + grid extraction. */
@@ -256,6 +268,10 @@ export declare class SchematicObject extends EventEmitter {
     private updateMeshVisibility;
     updateMesh(): Promise<void>;
     private updateMeshNow;
+    /** Release meshes and GPU-owned tables, including detached progressive batches. */
+    private clearBuiltMeshes;
+    /** Stop future staging/edit work immediately, then release the settled build. */
+    dispose(): Promise<void>;
     rebuildMesh(): Promise<void>;
     private rebuildMeshNow;
     getSchematicWrapper(): SchematicWrapper;
@@ -393,7 +409,6 @@ export declare class SchematicObject extends EventEmitter {
     gpuBuilt: boolean;
     /** Schematic-space cells hidden via the inspector ("x,y,z"); applied on GPU rebuilds */
     hiddenCells: Set<string>;
-    private applyHiddenCells;
     /** Surface-only inspector edits replace their affected sections in every build mode. */
     hideBlockAndRebuild(x: number, y: number, z: number): Promise<boolean>;
     unhideAllBlocks(): Promise<boolean>;
@@ -410,6 +425,8 @@ export declare class SchematicObject extends EventEmitter {
     rebuildAllChunks(): void;
     private getChunkCoordinates;
     rebuildChunk(chunkX: number, chunkY: number, chunkZ: number): Promise<void>;
+    private readChunkApron;
+    private rebuildChunkNow;
     private removeChunkObjects;
     containsPosition(position: THREE.Vector3): boolean;
     getSchematicCenter(): THREE.Vector3;

@@ -13,23 +13,29 @@
  * follow-up once three's WebGPURenderer path is validated for the atlas materials.
  */
 import * as THREE from "three";
+import type { RecordStream } from "./RecordRenderer";
 type PaletteEntry = {
     index: number;
     category: string;
     occlusionFlags: number;
+    fluid?: "water" | "lava";
     geometries: Array<{
         positions: Float32Array | number[];
         normals: Float32Array | number[];
         uvs: Float32Array | number[];
-        indices: Uint32Array | Uint16Array | number[];
+        indices: Uint32Array | Uint16Array | number[] | null;
         materialIndex: number;
+        category?: string;
     }>;
 };
 export declare class GpuMeshBuilder {
     private device;
     private pipeline;
-    private module;
+    private recordPipeline;
+    private generation;
     available: boolean;
+    /** Each schematic owns its compute device; release it when the schematic is removed. */
+    dispose(): void;
     init(): Promise<boolean>;
     /** Flatten palette descriptors + templates into GPU buffers (reusable across meshes). */
     private buildTemplateBuffers;
@@ -45,9 +51,9 @@ export declare class GpuMeshBuilder {
      * Returns one pulling mesh per non-empty category plus the record stream for
      * verification. Falls back to plain buildMeshes on any WebGPU failure upstream.
      */
-    buildRecordMeshes(grid: Uint32Array, sx: number, sy: number, sz: number, palette: PaletteEntry[], materialLookup: (category: string) => THREE.Material[]): Promise<{
-        meshes: import("three").Mesh[];
-        stream: any;
+    buildRecordMeshes(grid: Uint32Array, sx: number, sy: number, sz: number, palette: PaletteEntry[], materialLookup: (category: string) => THREE.Material[], makeDrawingMeshes?: boolean): Promise<{
+        meshes: THREE.Mesh[];
+        stream: RecordStream | null;
     }>;
 }
 export {};

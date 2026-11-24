@@ -17,10 +17,10 @@ export interface FluidBuildResult {
 }
 /** Palette-level early exit avoids scanning dry schematics for a fluid surface. */
 export declare function hasFluid(state: string): boolean;
-export declare function buildFluidMeshes(getBlock: GetBlock, sx: number, sy: number, sz: number): FluidBuildResult;
-/** Optional explicit source; otherwise `globalThis.liquidFrameTextures` is used lazily. */
+export declare function buildFluidMeshes(getBlock: GetBlock, sx: number, sy: number, sz: number, textures?: FluidTextures): FluidBuildResult;
+/** Compatibility default for standalone callers. Explicitly sourced meshes are unaffected. */
 export declare function setFluidTextures(src: FluidTextures | null): void;
-export declare function createFluidMaterial(kind: FluidKind, _logged?: boolean): THREE.ShaderMaterial;
+export declare function createFluidMaterial(kind: FluidKind, _logged?: boolean, textures?: FluidTextures): THREE.ShaderMaterial;
 /** Optional external clock; mesh callbacks update only their own material. */
 export declare function updateFluidTime(t: number): void;
 export declare function disposeFluidMeshes(meshes: THREE.Mesh[]): void;

@@ -68,6 +68,7 @@ async function run(renderer) {
  const errors=renderer.renderManager.renderer.info.programs?.filter(p=>p.diagnostics?.runnable===false)||[];
  check(!errors.length,"All render shaders compile");
  recordPixelCheck(renderer.renderManager.renderer);
+ if(mode === "incremental") await incrementalSeamCheck(renderer);
  if(params.has("benchmark")) {
   await renderer.schematicManager.removeAllSchematics();
   for(const name of ["cubes_64x48x64","stress_64x48x64"]) {
@@ -84,6 +85,25 @@ async function run(renderer) {
   }
  }
  lines.push("COMPLETE"); report.textContent=lines.join("\n");
+}
+
+async function incrementalSeamCheck(renderer) {
+ const schematic = new SchematicWrapper();
+ schematic.set_block(15,0,0,"minecraft:stone");
+ schematic.set_block(16,0,0,"minecraft:stone");
+ schematic.set_block(48,0,0,"minecraft:stone");
+ await renderer.schematicManager.loadSchematic("incremental-seam",schematic);
+ const object = renderer.schematicManager.getSchematic("incremental-seam");
+ await object.getMeshes();
+ const count = () => object.meshes.reduce((total,mesh) => total+(mesh.geometry?.index?.count ?? 0)/3,0);
+ const distant = object.getChunkObjectsAt(3,0,0);
+ check(count()===32 && distant?.length,"Initial mesh culls the shared face across the seam");
+ await object.setBlock([15,0,0],"minecraft:air");
+ check(count()===24,"Removing a seam block exposes the neighboring face");
+ await object.setBlock([15,0,0],"minecraft:stone");
+ check(count()===32,"Restoring a seam block culls both shared faces");
+ check(object.getChunkObjectsAt(3,0,0)===distant,"Seam edits preserve the distant chunk");
+ await renderer.schematicManager.removeSchematic("incremental-seam");
 }
 
 // This exercises the real WebGL pulling shader and shader-generated vertices

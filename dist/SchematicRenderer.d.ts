@@ -56,6 +56,7 @@ export declare class SchematicRenderer {
     timings: Map<string, number>;
     fps: number;
     private resourcePackManager;
+    private packUnsubscribers;
     packs: ResourcePackManagerProxy;
     /** Unified sidebar UI manager */
     sidebar: SidebarManager | undefined;
@@ -105,11 +106,8 @@ export declare class SchematicRenderer {
      * Set up callbacks for resource pack events
      */
     private setupResourcePackCallbacks;
-    /**
-     * Reload all enabled resource packs into Cubane
-     * @param force - Force reload even if Cubane already has packs loaded
-     */
-    private reloadResourcePacksIntoCubane;
+    /** Refresh meshes after the owning asset pipeline has rebuilt its atlas. */
+    refreshResourceAssets(): Promise<void>;
     /**
      * Rebuild all loaded schematics (e.g., after resource pack changes)
      */
@@ -259,7 +257,6 @@ export declare class SchematicRenderer {
     addResourcePack(file: File): Promise<void>;
     toggleResourcePackEnabled(name: string, enabled: boolean): Promise<void>;
     removeResourcePack(name: string): Promise<void>;
-    private reloadResources;
     /**
      * Shows the performance dashboard via the sidebar
      */

@@ -18,6 +18,7 @@ export declare class InstancedBlockRenderer {
         paletteIndex: number;
     }>): void;
     private setInstancesWithOverflow;
+    private ensureCapacity;
     private clearOverflowInstances;
     private logInstancedStats;
     private configureMeshForCategory;

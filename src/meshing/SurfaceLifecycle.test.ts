@@ -109,6 +109,49 @@ const triangles = (meshes: THREE.Mesh[]) =>
 		0
 	);
 
+describe("incremental chunk edits", () => {
+	it("rebuilds each affected face neighbor once and passes only one-block aprons", async () => {
+		const { object, cells } = schematic();
+		object.schematicRenderer.options.meshBuildingMode = "incremental";
+		object.chunkDimensions = { chunkWidth: 16, chunkHeight: 8, chunkLength: 4 };
+		object.chunkMeshes = new Map();
+		vi.spyOn(object, "getPalettes").mockReturnValue({ default: [] });
+		const chunkReads = vi.fn(() => ({ blocks: new Int32Array([0, 0, 0, 1]), entities: [] }));
+		const apronReads = vi.fn((x: number, y: number, z: number) =>
+			x === -1 && y === 0 && z === 0 ? [[-1, 1, 1, 1]] : []
+		);
+		object.schematicWrapper.getChunkData = chunkReads;
+		object.schematicWrapper.get_chunk_blocks_indices = apronReads;
+		object.worldMeshBuilder.precomputePaletteGeometries = vi.fn();
+		const build = vi.fn(async (_chunk: { apronBlocks?: Int32Array }) => []);
+		object.worldMeshBuilder.getChunkMesh = build;
+
+		await object.setBlocks([
+			[[0.25, 7.5, 3.5], "minecraft:stone"],
+			[[0, 6, 3], "minecraft:stone"],
+			[[4, 3, 2], "minecraft:stone"],
+		]);
+		expect(cells.get("0,7,3")).toBe("minecraft:stone");
+
+		expect(chunkReads.mock.calls).toEqual([
+			[0, 0, 0, 16, 8, 4],
+			[-1, 0, 0, 16, 8, 4],
+			[0, 1, 0, 16, 8, 4],
+			[0, 0, 1, 16, 8, 4],
+		]);
+		expect(apronReads.mock.calls.slice(0, 6)).toEqual([
+			[-1, 0, 0, 1, 8, 4],
+			[16, 0, 0, 1, 8, 4],
+			[0, -1, 0, 16, 1, 4],
+			[0, 8, 0, 16, 1, 4],
+			[0, 0, -1, 16, 8, 1],
+			[0, 0, 4, 16, 8, 1],
+		]);
+		expect(build.mock.calls[0][0].apronBlocks).toEqual(new Int32Array([-1, 1, 1, 1]));
+		expect(object.rebuildMeshNow).not.toHaveBeenCalled();
+	});
+});
+
 describe("surface edit lifecycle", () => {
 	it("does not let concurrent schematics replace a shared builder palette mid-build", async () => {
 		const first = buildableSchematic(),

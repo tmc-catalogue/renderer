@@ -1,15 +1,10 @@
 import * as THREE from "three";
 import { AssetLoader } from "./AssetLoader";
 import { TextureAnimationMetadata } from "./types";
-/**
- * Animation metadata structure that matches Minecraft's mcmeta format
- */
-/**
- * Extended class to handle animated textures
- */
 export declare class AnimatedTextureManager {
     private assetLoader;
     private animatedTextures;
+    private pending;
     private generation;
     private pendingImages;
     constructor(assetLoader: AssetLoader);
@@ -29,6 +24,7 @@ export declare class AnimatedTextureManager {
      * Create an animated texture
      */
     createAnimatedTexture(texturePath: string): Promise<THREE.Texture | null>;
+    private loadTexture;
     /**
      * Update all animated textures. Returns `true` if any texture advanced a frame
      * this call (i.e. the scene now needs a redraw). Returning a dirty flag lets the

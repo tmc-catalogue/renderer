@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import type { SchematicRenderer } from "./SchematicRenderer";
+import type { SchematicRendererContext } from "./SchematicRendererContext";
 import type { Cubane } from "./cubane";
 import type { ChunkMeshes } from "./types";
 
@@ -17,6 +18,7 @@ import { WorldMeshBuilder } from "./WorldMeshBuilder";
 import { MaterialRegistry } from "./MaterialRegistry";
 import { buildChestBlockMesh } from "./meshing/ChestModels";
 import { AssetLoader } from "./cubane/AssetLoader";
+import { getSharedMemoryPool } from "./workers/SharedMemoryManager";
 
 interface PaletteDescriptor {
 	index: number;
@@ -98,6 +100,150 @@ afterEach(() => {
 	MaterialRegistry.clear();
 	vi.restoreAllMocks();
 	expect(warnings).toEqual([]);
+});
+
+describe("shared mesh worker lifetime", () => {
+	function sharedBuilders(useSharedMemory = true) {
+		vi.spyOn(performance, "now").mockReturnValue(0);
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(getSharedMemoryPool(), "usingSharedMemory").mockReturnValue(useSharedMemory);
+		const transport = {
+			postMessage: vi.fn(),
+			terminate: vi.fn(),
+			onmessage: null as Worker["onmessage"],
+		};
+		const worker = transport as unknown as Worker;
+		const context = {
+			getSharedWorkers: () => [worker],
+			sharedFreeWorkers: [worker],
+			sharedWorkerQueue: [] as Array<(worker: Worker) => void>,
+		} as unknown as SchematicRendererContext;
+		const create = () => {
+			const builder = new WorldMeshBuilder(
+				{
+					options: {
+						context,
+						gpuComputeOptions: { enabled: false },
+						wasmMeshBuilderOptions: { enabled: true, maxWorkers: 1 },
+					},
+				} as SchematicRenderer,
+				{} as Cubane
+			);
+			builders.push(builder);
+			return builder;
+		};
+		const reply = (data: unknown) => worker.onmessage?.call(worker, { data } as MessageEvent);
+		const chunk = () => ({
+			chunk_x: 0,
+			chunk_y: 0,
+			chunk_z: 0,
+			blocks: Int32Array.of(0, 0, 0, 1),
+		});
+		const requests = (type: string) =>
+			transport.postMessage.mock.calls.map(([message]) => message).filter((m) => m.type === type);
+		return { create, context, transport, reply, chunk, requests };
+	}
+
+	it.each([true, false])(
+		"cancels active and queued requests (shared memory: %s)",
+		async (shared) => {
+			const { create, context, transport, reply, chunk, requests } = sharedBuilders(shared);
+			const old = create();
+			const next = create();
+			await Promise.all([
+				old.precomputePaletteGeometries([]),
+				next.precomputePaletteGeometries([]),
+			]);
+			const released = vi.spyOn(getSharedMemoryPool(), "releaseBuffers");
+			const active = old.getChunkGeometries(chunk());
+			const queued = old.getChunkGeometries(chunk());
+			const sibling = next.getChunkGeometries(chunk());
+			await vi.waitFor(() => expect(requests("buildChunk")).toHaveLength(1));
+			expect(context.sharedWorkerQueue).toHaveLength(2);
+
+			old.dispose();
+			await vi.waitFor(() => expect(requests("buildChunk")).toHaveLength(2));
+			const [stale, current] = requests("buildChunk");
+			expect(current.chunkId).not.toBe(stale.chunkId);
+			expect(context.sharedWorkerQueue).toHaveLength(0);
+			const result = { type: "chunkBuilt", meshes: [], origin: [16, 0, 0] };
+			// Replay a reply from the disposed renderer even if its chunk coordinates
+			// coincide with the replacement request's coordinates.
+			reply({ ...result, chunkId: current.chunkId, meshContextId: stale.meshContextId });
+			expect(context.sharedFreeWorkers).toHaveLength(0);
+			reply({ ...result, chunkId: current.chunkId, meshContextId: current.meshContextId });
+			await expect(sibling).resolves.toEqual({ geometries: [], origin: [16, 0, 0] });
+			for (const cancelled of [active, queued])
+				await expect(cancelled).resolves.toEqual({ geometries: [], origin: [0, 0, 0] });
+			expect(context.sharedFreeWorkers).toHaveLength(1);
+			expect(transport.terminate).not.toHaveBeenCalled();
+			if (shared) {
+				expect(stale.sharedInputBuffer).toBeInstanceOf(SharedArrayBuffer);
+				expect(released.mock.calls).toEqual([[stale.chunkId], [current.chunkId]]);
+			} else {
+				const stalePost = transport.postMessage.mock.calls.find(([message]) => message === stale);
+				expect(stalePost?.[1]).toEqual([stale.blocks.buffer]);
+				expect(released).not.toHaveBeenCalled();
+			}
+		}
+	);
+
+	it.each([false, true])(
+		"returns a disposed batch lease once (finishing: %s)",
+		async (finishing) => {
+			const { create, context, reply, chunk, requests } = sharedBuilders();
+			const old = create();
+			const next = create();
+			await Promise.all([
+				old.precomputePaletteGeometries([]),
+				next.precomputePaletteGeometries([]),
+			]);
+			const released = vi.spyOn(getSharedMemoryPool(), "releaseBuffers");
+			const cancelled = expect(old.processChunksBatched([chunk()])).rejects.toThrow(
+				"Mesh builder disposed"
+			);
+			const sibling = next.processChunksBatched([chunk()]);
+			await vi.waitFor(() => expect(requests("buildChunkBatched")).toHaveLength(1));
+			const [stale] = requests("buildChunkBatched");
+			if (finishing) {
+				reply({
+					type: "chunkAccumulated",
+					chunkId: stale.chunkId,
+					meshContextId: stale.meshContextId,
+				});
+				await vi.waitFor(() => expect(requests("finishBatch")).toHaveLength(1));
+			}
+			old.dispose();
+			await cancelled;
+			await vi.waitFor(() => expect(requests("buildChunkBatched")).toHaveLength(2));
+			const [, current] = requests("buildChunkBatched");
+			reply({
+				type: "chunkAccumulated",
+				chunkId: current.chunkId,
+				meshContextId: current.meshContextId,
+			});
+			await vi.waitFor(() => expect(requests("finishBatch")).toHaveLength(finishing ? 2 : 1));
+			const finish = requests("finishBatch")[finishing ? 1 : 0];
+			reply({ type: "batchFinished", chunkId: finish.chunkId, meshContextId: stale.meshContextId });
+			reply({
+				type: "batchFinished",
+				chunkId: stale.chunkId,
+				meshContextId: current.meshContextId,
+			});
+			expect(context.sharedFreeWorkers).toHaveLength(0);
+			reply({
+				type: "batchFinished",
+				chunkId: finish.chunkId,
+				meshContextId: current.meshContextId,
+				meshes: [],
+				origin: [0, 0, 0],
+			});
+			await expect(sibling).resolves.toEqual([]);
+			expect(context.sharedFreeWorkers).toHaveLength(1);
+			expect(stale.sharedInputBuffer).toBeInstanceOf(SharedArrayBuffer);
+			expect(released.mock.calls).toEqual([[stale.chunkId], [current.chunkId]]);
+		}
+	);
 });
 
 describe("palette mesh extraction", () => {

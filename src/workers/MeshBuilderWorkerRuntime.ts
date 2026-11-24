@@ -98,34 +98,40 @@ export class MeshBuilderWorkerRuntime {
 						(message.paletteData as PaletteGeometryData[]).map((item) => [item.index, item])
 					);
 					this.update?.(context.palette, meshContextId);
-					this.send({ type: "paletteUpdated", count: context.palette.size });
+					this.send({ type: "paletteUpdated", meshContextId, count: context.palette.size });
 					break;
 				case "startBatch":
 					context.batch = [];
-					this.send({ type: "batchStarted" });
+					this.send({ type: "batchStarted", meshContextId });
 					break;
 				case "buildChunk": {
 					const result = this.build(message, context.palette, meshContextId);
-					this.send({ type: "chunkBuilt", chunkId, ...result }, resultTransferables(result));
+					this.send(
+						{ type: "chunkBuilt", meshContextId, chunkId, ...result },
+						resultTransferables(result)
+					);
 					break;
 				}
 				case "buildChunkBatched": {
 					const result = this.build(message, context.palette, meshContextId);
 					context.batch.push(result);
-					this.send({ type: "chunkAccumulated", chunkId, timings: result.timings });
+					this.send({ type: "chunkAccumulated", meshContextId, chunkId, timings: result.timings });
 					break;
 				}
 				case "finishBatch": {
 					const result = mergeChunkResults(context.batch);
 					context.batch = [];
-					this.send({ type: "batchFinished", ...result }, resultTransferables(result));
+					this.send(
+						{ type: "batchFinished", meshContextId, chunkId, ...result },
+						resultTransferables(result)
+					);
 					break;
 				}
 				case "setGreedyMeshing":
 					// The old cube-merging algorithm disregards model geometry and atlas
 					// tile boundaries. Retain exact culled meshes until a UV-aware merge
 					// can be proven equivalent; callers must not lose their geometry.
-					this.send({ type: "greedyMeshingSet", enabled: false });
+					this.send({ type: "greedyMeshingSet", meshContextId, enabled: false });
 					break;
 				default:
 					throw new Error(`Unknown mesh worker message: ${type}`);
@@ -133,6 +139,7 @@ export class MeshBuilderWorkerRuntime {
 		} catch (error) {
 			this.send({
 				type: "error",
+				meshContextId,
 				chunkId,
 				error: error instanceof Error ? error.message : String(error),
 			});

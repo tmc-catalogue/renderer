@@ -7,6 +7,7 @@ export declare class MaterialRegistry {
     private static instance;
     private materials;
     private materialRefCount;
+    private materialKeys;
     private constructor();
     static getInstance(): MaterialRegistry;
     /**

@@ -128,6 +128,7 @@ export interface BlockModelOption {
 }
 export interface ChunkMeshes {
     solid: Mesh | null;
+    cutout: Mesh | null;
     water: Mesh | null;
     redstone: Mesh | null;
     transparent: Mesh | null;

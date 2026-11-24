@@ -141,7 +141,7 @@ export class InstancedBlockRenderer {
 					return;
 				}
 
-				const instancedMesh = new THREE.InstancedMesh(geometry, material, this.maxInstancesPerType);
+				const instancedMesh = new THREE.InstancedMesh(geometry, material, 0);
 
 				instancedMesh.name = `instanced_${blockTypeKey}_part${groupIndex}`;
 				instancedMesh.userData.paletteIndex = paletteIndex;
@@ -198,7 +198,7 @@ export class InstancedBlockRenderer {
 			for (const [material, geometries] of byMaterial) {
 				const geometry = this.mergeGeometriesManual(geometries);
 				if (!geometry) continue;
-				const mesh = new THREE.InstancedMesh(geometry, material, this.maxInstancesPerType);
+				const mesh = new THREE.InstancedMesh(geometry, material, 0);
 				mesh.name = `instanced_${blockTypeKey}_merged_${meshes.length}`;
 				mesh.userData.paletteIndex = paletteIndex;
 				mesh.userData.blockTypeKey = blockTypeKey;
@@ -242,7 +242,7 @@ export class InstancedBlockRenderer {
 			if (!blocksByType.has(blockTypeKey)) {
 				blocksByType.set(blockTypeKey, []);
 			}
-			blocksByType.get(blockTypeKey)!.push({ x: block.x, y: block.y, z: block.z });
+			blocksByType.get(blockTypeKey)!.push(block);
 		}
 
 		blocksByType.forEach((positions, blockTypeKey) => {
@@ -277,13 +277,19 @@ export class InstancedBlockRenderer {
 		if (instanceCount > 0) {
 			const matrix = new THREE.Matrix4();
 
-			instancedMeshes.forEach((instancedMesh) => {
+			instancedMeshes.forEach((mesh, groupIndex) => {
+				const instancedMesh = this.ensureCapacity(mesh, instanceCount);
+				instancedMeshes[groupIndex] = instancedMesh;
 				for (let i = 0; i < instanceCount; i++) {
 					const pos = positions[i];
 					matrix.setPosition(pos.x, pos.y, pos.z);
 					instancedMesh.setMatrixAt(i, matrix);
 				}
+				instancedMesh.instanceMatrix.clearUpdateRanges();
+				instancedMesh.instanceMatrix.addUpdateRange(0, instanceCount * 16);
 				instancedMesh.instanceMatrix.needsUpdate = true;
+				instancedMesh.boundingBox = null;
+				instancedMesh.boundingSphere = null;
 			});
 		}
 
@@ -309,6 +315,25 @@ export class InstancedBlockRenderer {
 		}
 
 		this.instanceCounts.set(blockTypeKey, positions.length);
+	}
+
+	private ensureCapacity(mesh: THREE.InstancedMesh, count: number): THREE.InstancedMesh {
+		const previousCapacity = mesh.instanceMatrix.count;
+		if (previousCapacity >= count) return mesh;
+		const capacity = Math.min(this.maxInstancesPerType, Math.max(count, previousCapacity * 2));
+
+		// Renderers cache instance bindings by mesh. Replace the mesh when the
+		// allocation grows so its old GPU buffer and bindings can be released.
+		const replacement = new THREE.InstancedMesh(mesh.geometry, mesh.material, 0);
+		THREE.Object3D.prototype.copy.call(replacement, mesh, false);
+		replacement.instanceMatrix = new THREE.InstancedBufferAttribute(
+			new Float32Array(capacity * 16),
+			16
+		).setUsage(THREE.DynamicDrawUsage);
+		this.group.remove(mesh);
+		mesh.dispose();
+		this.group.add(replacement);
+		return replacement;
 	}
 
 	private clearOverflowInstances(): void {
@@ -375,6 +400,7 @@ export class InstancedBlockRenderer {
 	}
 
 	public disposeInstancedMeshes(): void {
+		this.clearOverflowInstances();
 		this.instancedMeshes.forEach((meshes) => {
 			meshes.forEach((mesh) => {
 				this.group.remove(mesh);
