@@ -24,14 +24,15 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"main": "dist/schematic-renderer.umd.js",
+	"main": "dist/schematic-renderer.es.js",
 	"module": "dist/schematic-renderer.es.js",
 	"types": "dist/index.d.ts",
 	"exports": {
 		".": {
+			"types": "./dist/index.d.ts",
+			"module-sync": "./dist/schematic-renderer.es.js",
 			"import": "./dist/schematic-renderer.es.js",
-			"require": "./dist/schematic-renderer.umd.js",
-			"types": "./dist/index.d.ts"
+			"require": "./dist/schematic-renderer.umd.js"
 		},
 		"./pack.zip": "./dist/pack.zip"
 	},

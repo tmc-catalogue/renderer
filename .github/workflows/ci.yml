@@ -85,6 +85,32 @@ jobs:
       - name: Build
         run: bun run build
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify Node package entry points
+        run: |
+          smoke_dir=$(mktemp -d "$PWD/node_modules/.package-smoke.XXXXXX")
+          archive=$(bun pm pack --quiet --destination "$smoke_dir")
+          mkdir -p "$smoke_dir/node_modules/schematic-renderer"
+          tar -xzf "$archive" -C "$smoke_dir/node_modules/schematic-renderer" --strip-components=1
+          cd "$smoke_dir"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createRequire } from 'node:module';
+          import * as esm from 'schematic-renderer';
+          const cjs = createRequire(import.meta.url)('schematic-renderer');
+          assert.equal(typeof cjs.SchematicRenderer, 'function');
+          assert.equal(cjs.SchematicRenderer, esm.SchematicRenderer);
+          assert.equal(cjs.SchematicWrapper, esm.SchematicWrapper);
+          await cjs.initializeNucleationWasm();
+          const schematic = new esm.SchematicWrapper();
+          schematic.set_block(0, 0, 0, 'minecraft:stone');
+          assert.equal(schematic.get_block_string(0, 0, 0), 'minecraft:stone');
+          schematic.free();
+          NODE
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
