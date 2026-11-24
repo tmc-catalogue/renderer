@@ -59,8 +59,16 @@ export function getTemplateBounds(geometry: TemplateGeometry): [number[], number
 /** Actual Cubane coordinates are cell-centred; 0 and 1 are not alternate
  * cell boundaries. All three vertices must be on the face and inside its
  * square to be guaranteed occluded by a neighbour's full-face mask. */
-export function templateCullDirection(geom: TemplateGeometry, i: number, legacy = false): number {
-	const n = geom.indices[i] * 3;
+export function templateCullDirection(
+	geom: {
+		positions: ArrayLike<number>;
+		normals?: ArrayLike<number>;
+		indices: ArrayLike<number> | null;
+	},
+	i: number,
+	legacy = false
+): number {
+	const n = (geom.indices?.[i] ?? i) * 3;
 	if (!geom.normals?.length) return -1;
 	const round = legacy ? (v: number) => Math.sign(v) * Math.round(Math.abs(v)) : Math.round;
 	const dx = round(geom.normals[n]),
@@ -76,7 +84,7 @@ export function templateCullDirection(geom: TemplateGeometry, i: number, legacy 
 			return -1;
 	} else {
 		for (let j = 0; j < 3; j++) {
-			const p = geom.indices[i + j] * 3;
+			const p = (geom.indices?.[i + j] ?? i + j) * 3;
 			if (Math.abs(geom.positions[p + axis] - sign * 0.5) >= EPS) return -1;
 			for (let a = 0; a < 3; a++)
 				if (a !== axis && Math.abs(geom.positions[p + a]) > 0.5 + EPS) return -1;

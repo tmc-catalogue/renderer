@@ -14,6 +14,7 @@
  */
 
 import * as THREE from "three";
+import { templateCullDirection } from "../workers/MeshBuilderCore";
 import type { RecordMaterialRun, RecordStream } from "./RecordRenderer";
 
 const NEIGHBOR_CULL = /* wgsl */ `
@@ -273,10 +274,6 @@ type PaletteEntry = {
 	}>;
 };
 
-const E = 0.01;
-const slotOf = (dx: number, dy: number, dz: number) =>
-	dx === 1 ? 0 : dx === -1 ? 1 : dy === 1 ? 2 : dy === -1 ? 3 : dz === 1 ? 4 : dz === -1 ? 5 : 255;
-
 export class GpuMeshBuilder {
 	private device: GPUDevice | null = null;
 	private pipeline: GPUComputePipeline | null = null;
@@ -431,7 +428,9 @@ export class GpuMeshBuilder {
 				for (let v = 0; v < nrm.length; v++) tplNrm.push(nrm[v]);
 				for (let v = 0; v < uv.length; v++) tplUv.push(uv[v]);
 				const gAnim = (g as any).anim as
-					{ frames: number; step: number; vTop: number } | null | undefined;
+					| { frames: number; step: number; vTop: number }
+					| null
+					| undefined;
 				const nVerts = pos.length / 3;
 				for (let v = 0; v < nVerts; v++) {
 					tplUvW.push(gAnim ? gAnim.frames : 0);
@@ -443,27 +442,8 @@ export class GpuMeshBuilder {
 				while (tplUv.length < (tplPos.length / 3) * 2) tplUv.push(0);
 				for (let i = 0; i < idx.length; i++) tplIdx.push(vBase + idx[i]);
 				for (let tr = 0; tr + 2 < idx.length; tr += 3) {
-					const i0 = idx[tr];
-					let cull = 255;
-					if (nrm.length > i0 * 3 + 2) {
-						const dx = Math.round(nrm[i0 * 3]),
-							dy = Math.round(nrm[i0 * 3 + 1]),
-							dz = Math.round(nrm[i0 * 3 + 2]);
-						if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) === 1) {
-							const v0x = pos[i0 * 3],
-								v0y = pos[i0 * 3 + 1],
-								v0z = pos[i0 * 3 + 2];
-							const flush =
-								(dx === 1 && Math.abs(v0x - 0.5) < E) ||
-								(dx === -1 && Math.abs(v0x + 0.5) < E) ||
-								(dy === 1 && Math.abs(v0y - 0.5) < E) ||
-								(dy === -1 && Math.abs(v0y + 0.5) < E) ||
-								(dz === 1 && Math.abs(v0z - 0.5) < E) ||
-								(dz === -1 && Math.abs(v0z + 0.5) < E);
-							if (flush) cull = slotOf(dx, dy, dz);
-						}
-					}
-					tplCull.push(cull);
+					const direction = templateCullDirection(g, tr);
+					tplCull.push(direction < 0 ? 255 : direction);
 					tplTriMat.push(gMat);
 				}
 				// mark in-geometry quad pairs (t even offsets): rows (2k, 2k+1)

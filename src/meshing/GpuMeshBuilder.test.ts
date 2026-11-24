@@ -64,6 +64,29 @@ describe("GPU template encoding", () => {
 		expect([1, 2, 3, 4].map((i) => result.desc[i * 4 + 3])).toEqual([15, 0, 64, 191]);
 	});
 
+	it("keeps triangles that extend beyond a neighboring block's face", () => {
+		const normals = new Float32Array([1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0]);
+		const positions = new Float32Array([0.5, 0, 0, 0.5, 0.5, 0, 0.5, 0, 0.5, 0.5, 0.75, 0.5]);
+		const builder = new GpuMeshBuilder();
+		const result = (builder as any).buildTemplateBuffers([
+			{
+				index: 1,
+				category: "solid",
+				occlusionFlags: 0,
+				geometries: [
+					{
+						positions,
+						normals,
+						uvs: new Float32Array(8),
+						indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+						materialIndex: 0,
+					},
+				],
+			},
+		]);
+		expect(result.tplCull).toEqual([0, 255]);
+	});
+
 	it("does not cull an upper slab's recessed bottom face at the cell center", () => {
 		const builder = new GpuMeshBuilder();
 		const result = (builder as any).buildTemplateBuffers([

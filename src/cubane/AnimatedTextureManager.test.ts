@@ -99,6 +99,26 @@ describe("animated texture cache invalidation", () => {
 		expect(texture.version).toBe(version);
 	});
 
+	it.each([
+		{ frames: {}, order: [0.5, 0] },
+		{ frames: [null, { index: 1 }, false, 0], order: [0, 0.5] },
+	])("loads a texture with malformed frame metadata ($frames)", async ({ frames, order }) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { manager, assets, images, revoke } = setup();
+		assets.getResourceString.mockResolvedValue(JSON.stringify({ animation: { frames } }));
+		const pending = manager.createAnimatedTexture("block/kelp");
+		await vi.waitFor(() => expect(images).toHaveLength(1));
+		images[0].onload!();
+		const texture = (await pending)!;
+		expect(texture.offset.y).toBe(order[0]);
+		vi.setSystemTime(Date.now() + 50);
+		expect(manager.update()).toBe(true);
+		expect(texture.offset.y).toBe(order[1]);
+		expect(revoke).toHaveBeenCalledOnce();
+		texture.dispose();
+	});
+
 	it("interpolates RGB between requested frames without changing current alpha", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(0);

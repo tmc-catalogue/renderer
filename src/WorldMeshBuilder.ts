@@ -1571,7 +1571,8 @@ export class WorldMeshBuilder {
 			if (blockEntityMap.size > 0 && blockEntityMap.size < 10000) {
 				// Use spatial cache if available, otherwise build it once
 				let spatialCache = (schematicObject as any)._entitySpatialCache as
-					Map<string, any[]> | undefined;
+					| Map<string, any[]>
+					| undefined;
 
 				if (!spatialCache) {
 					spatialCache = new Map<string, any[]>();

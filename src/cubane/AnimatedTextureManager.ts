@@ -256,19 +256,25 @@ export class AnimatedTextureManager {
 				const columns = image.width / width,
 					rows = image.height / height;
 				const frameCount = columns * rows;
-				const defaultTime = Math.max(1, Math.floor(animation.frametime || 1));
+				const frameTime = animation.frametime ?? 1;
+				const defaultTime = Number.isSafeInteger(frameTime) && frameTime > 0 ? frameTime : 1;
 				const indices: number[] = [],
 					ends: number[] = [];
 				let duration = 0;
-				for (const frame of animation.frames ?? Array.from({ length: frameCount }, (_, i) => i)) {
+				const frames = Array.isArray(animation.frames) ? animation.frames : undefined;
+				const length = frames?.length ?? frameCount;
+				for (let i = 0; i < length; i++) {
+					const frame = frames ? frames[i] : i;
+					if (typeof frame !== "number" && (typeof frame !== "object" || frame === null)) continue;
 					const index = typeof frame === "number" ? frame : frame.index;
 					const time = typeof frame === "number" ? defaultTime : (frame.time ?? defaultTime);
 					if (
 						!Number.isInteger(index) ||
 						index < 0 ||
 						index >= frameCount ||
-						!Number.isInteger(time) ||
-						time <= 0
+						!Number.isSafeInteger(time) ||
+						time <= 0 ||
+						!Number.isSafeInteger(duration + time)
 					)
 						continue;
 					indices.push(index);
