@@ -16,7 +16,7 @@ export interface Block {
 export interface TextureAnimationMetadata {
 	animation: {
 		frametime?: number; // How long each frame lasts (in ticks, default: 1)
-		frames?: number[]; // Optional custom frame order
+		frames?: (number | { index: number; time?: number })[]; // Optional order and per-frame duration
 		interpolate?: boolean; // Whether to interpolate between frames
 		width?: number; // Optional frame width
 		height?: number; // Optional frame height

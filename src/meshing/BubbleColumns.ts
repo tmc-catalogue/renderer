@@ -67,7 +67,7 @@ export function buildBubbleMesh(cells: BubbleCell[], texture: THREE.Texture): TH
 	geometry.boundingBox = bounds;
 	geometry.boundingSphere = bounds.getBoundingSphere(new THREE.Sphere());
 	const material = new THREE.ShaderMaterial({
-		uniforms: { uTime: { value: 0 }, uBubble: { value: texture } },
+		uniforms: { uTime: { value: 0 }, uBubble: { value: texture }, uOpacity: { value: 1 } },
 		vertexShader: `
 			attribute vec4 aColumn;
 			attribute vec4 aSeed;
@@ -88,12 +88,13 @@ export function buildBubbleMesh(cells: BubbleCell[], texture: THREE.Texture): TH
 			}`,
 		fragmentShader: `
 			uniform sampler2D uBubble;
+			uniform float uOpacity;
 			varying vec2 vUv;
 			varying float vFade;
 			void main() {
 				vec4 bubble = texture2D(uBubble, vUv);
 				if (bubble.a < 0.1) discard;
-				gl_FragColor = vec4(bubble.rgb, bubble.a * vFade);
+				gl_FragColor = vec4(bubble.rgb, bubble.a * vFade * uOpacity);
 				#include <tonemapping_fragment>
 				#include <colorspace_fragment>
 			}`,
@@ -102,10 +103,10 @@ export function buildBubbleMesh(cells: BubbleCell[], texture: THREE.Texture): TH
 	});
 	const mesh = new THREE.Mesh(geometry, material);
 	mesh.name = "bubble-column-particles";
-	// Render behind the water surface, but test against opaque blocks normally.
-	mesh.renderOrder = 2;
+	// Participate in normal camera-depth sorting with other translucent batches.
 	mesh.onBeforeRender = () => {
 		material.uniforms.uTime.value = performance.now() / 1000;
+		material.uniforms.uOpacity.value = material.opacity;
 	};
 	return mesh;
 }

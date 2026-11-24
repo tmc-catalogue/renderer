@@ -200,19 +200,60 @@ export function glassConnections(
 	});
 }
 
+const opaqueHighlights = new WeakMap<THREE.Material, THREE.Material>();
+type GlassPass = "all" | "opaque" | "translucent";
+
 export function makeGlassMaterial(
 	map: THREE.Texture,
 	connected: boolean,
-	clip = { value: new THREE.Vector2(0, 1e9) }
+	clip = { value: new THREE.Vector2(0, 1e9) },
+	source?: THREE.Material
+): THREE.MeshBasicMaterial {
+	// Binary glass windows are cutouts, so the opaque borders/highlights must
+	// occlude water and other glass behind them. Stained/resource-pack alpha
+	// stays blended rather than discarding legitimate translucent texels.
+	const transparent = source?.transparent ?? true;
+	const split =
+		transparent &&
+		source?.opacity === 1 &&
+		source.userData.alphaClass === "blend" &&
+		source.userData.hasOpaquePixels;
+	const material = createGlassPass(
+		map,
+		connected,
+		clip,
+		transparent,
+		source?.alphaTest ?? 0.01,
+		source?.opacity ?? 1,
+		split ? "translucent" : "all"
+	);
+	if (split) {
+		const highlight = createGlassPass(map, connected, clip, false, 0, 1, "opaque");
+		highlight.userData.surfaceCacheOwned = true;
+		opaqueHighlights.set(material, highlight);
+		material.addEventListener("dispose", () => highlight.dispose());
+	}
+	return material;
+}
+
+function createGlassPass(
+	map: THREE.Texture,
+	connected: boolean,
+	clip: { value: THREE.Vector2 },
+	transparent: boolean,
+	alphaTest: number,
+	opacity: number,
+	part: GlassPass
 ): THREE.MeshBasicMaterial {
 	const material = new THREE.MeshBasicMaterial({
 		map,
-		transparent: true,
-		alphaTest: 0.01,
-		depthWrite: false,
+		transparent,
+		alphaTest,
+		opacity,
+		depthWrite: !transparent,
 		side: THREE.FrontSide,
 	});
-	material.userData.surfaceTransparent = true;
+	material.userData.surfaceTransparent = transparent;
 	const uLayerClip = clip;
 	// The viewer's layer control uses the same uniform on conventional and pulling meshes.
 	Object.assign(material, { uniforms: { uLayerClip } });
@@ -266,8 +307,20 @@ if (!corner) {
 diffuseColor *= texture2D(map, glassUv);
 `
 			);
+		if (part !== "all") {
+			// The map (including connected-edge UV remapping) has already been sampled.
+			// Select source alpha, not schematic opacity, so the two passes stay
+			// mutually exclusive even while the whole schematic fades.
+			shader.fragmentShader = shader.fragmentShader.replace(
+				"#include <color_fragment>",
+				`#include <color_fragment>
+if (opacity <= 0.0) discard;
+float glassSourceAlpha = diffuseColor.a / opacity;
+if (glassSourceAlpha ${part === "opaque" ? "<" : ">="} 0.999) discard;`
+			);
+		}
 	};
-	material.customProgramCacheKey = () => `connected-glass-${connected}`;
+	material.customProgramCacheKey = () => `connected-glass-${connected}-${part}`;
 	return material;
 }
 
@@ -344,7 +397,7 @@ export function buildGlassMeshes(
 			);
 		}
 	}
-	return [...batches.values()].map((b) => {
+	return [...batches.values()].flatMap((b) => {
 		const geometry = new THREE.BufferGeometry();
 		geometry.setAttribute("position", new THREE.Float32BufferAttribute(b.positions, 3));
 		geometry.setAttribute("uv", new THREE.Float32BufferAttribute(b.uvs, 2));
@@ -353,11 +406,20 @@ export function buildGlassMeshes(
 		geometry.setAttribute("aCellY", new THREE.Float32BufferAttribute(b.cellY, 1));
 		geometry.setIndex(b.indices);
 		geometry.computeBoundingSphere();
-		const mesh = new THREE.Mesh(geometry, b.material);
-		mesh.name = "connected-glass-and-portals";
-		mesh.renderOrder = 2;
-		mesh.userData.surfaceMesh = true;
-		installSurfaceSorting(mesh, new Float32Array(b.centers));
-		return mesh;
+		const centers = new Float32Array(b.centers);
+		const build = (g: THREE.BufferGeometry, material: THREE.Material, name: string) => {
+			const mesh = new THREE.Mesh(g, material);
+			mesh.name = name;
+			mesh.userData.surfaceMesh = true;
+			installSurfaceSorting(mesh, centers, true);
+			return mesh;
+		};
+		// Even cutout glass can be faded by a schematic's opacity control. Sort
+		// only once it actually needs blending, keeping the common cutout path fast.
+		const mesh = build(geometry, b.material, "connected-glass-and-portals");
+		const highlight = opaqueHighlights.get(b.material);
+		return highlight
+			? [build(geometry.clone(), highlight, "glass-opaque-highlights"), mesh]
+			: [mesh];
 	});
 }

@@ -14,6 +14,78 @@
  */
 
 import * as THREE from "three";
+import { templateCullDirection } from "../workers/MeshBuilderCore";
+import type { RecordMaterialRun, RecordStream } from "./RecordRenderer";
+
+const NEIGHBOR_CULL = /* wgsl */ `
+const DIRS = array<vec3<i32>, 6>(
+  vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0),
+  vec3<i32>(0, 1, 0), vec3<i32>(0, -1, 0),
+  vec3<i32>(0, 0, 1), vec3<i32>(0, 0, -1),
+);
+
+fn neighborOccludes(cell: vec3<u32>, side: u32, sourceFlags: u32) -> bool {
+  let n = vec3<i32>(cell) + DIRS[side];
+  if (n.x < 0 || n.y < 0 || n.z < 0 || n.x >= i32(dims.sx) || n.y >= i32(dims.sy) || n.z >= i32(dims.sz)) {
+    return false;
+  }
+  let nu = vec3<u32>(n);
+  let pv = grid[(nu.y * dims.sz + nu.z) * dims.sx + nu.x];
+  if (pv == 0u) { return false; }
+  let neighborFlags = desc[pv].w;
+  let fluid = sourceFlags & 192u;
+  return (neighborFlags & (1u << side)) != 0u ||
+         (fluid != 0u && (neighborFlags & 192u) == fluid);
+}
+`;
+
+// Record emission only uses eight storage buffers. Keep it independent of the
+// conventional vertex pipeline so WebGPU adapters with the standard storage
+// binding limit can run GPU culling and emit directly to the record renderer.
+const RECORD_SHADER = /* wgsl */ `
+struct Dims { sx: u32, sy: u32, sz: u32, mode: u32, nSlots: u32, y0: u32, slabH: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read> grid: array<u32>;
+@group(0) @binding(1) var<uniform> dims: Dims;
+@group(0) @binding(2) var<storage, read> desc: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> desc2: array<vec4<u32>>;
+@group(0) @binding(4) var<storage, read> tpl_tri_cull: array<u32>;
+@group(0) @binding(5) var<storage, read_write> counters: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read> cat_offsets: array<u32>;
+@group(0) @binding(7) var<storage, read> tpl_tri_mat: array<u32>;
+@group(0) @binding(8) var<storage, read_write> out_records: array<vec2<u32>>;
+${NEIGHBOR_CULL}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= dims.sx || gid.y >= dims.slabH || gid.z >= dims.sz) { return; }
+  let cell = vec3<u32>(gid.x, gid.y + dims.y0, gid.z);
+  let ci = (cell.y * dims.sz + cell.z) * dims.sx + cell.x;
+  let pv = grid[ci];
+  if (pv == 0u) { return; }
+  let d0 = desc[pv];
+  let d1 = desc2[pv];
+  let triStart = d0.z;
+  let triCount = d1.y / 3u;
+  let slotBase = d1.w;
+  var nbCulled: array<bool, 6>;
+  var nbKnown: array<bool, 6>;
+  for (var t = 0u; t < triCount; t++) {
+    let side = tpl_tri_cull[triStart + t];
+    if (side != 255u) {
+      if (!nbKnown[side]) {
+        nbKnown[side] = true;
+        nbCulled[side] = neighborOccludes(cell, side, d0.w);
+      }
+      if (nbCulled[side]) { continue; }
+    }
+    let seg = slotBase + tpl_tri_mat[triStart + t];
+    let i = atomicAdd(&counters[seg * 2u + 1u], 1u);
+    if (dims.mode == 3u) {
+      out_records[cat_offsets[dims.nSlots + seg] + i] = vec2<u32>(ci, triStart + t);
+    }
+  }
+}
+`;
 
 const SHADER = /* wgsl */ `
 struct Dims { sx: u32, sy: u32, sz: u32, mode: u32, nSlots: u32, y0: u32, slabH: u32, _p: u32 };
@@ -39,11 +111,7 @@ struct Dims { sx: u32, sy: u32, sz: u32, mode: u32, nSlots: u32, y0: u32, slabH:
 @group(0) @binding(15) var<storage, read_write> out_nrm: array<f32>;
 @group(0) @binding(16) var<storage, read_write> out_uv: array<f32>;
 
-const DIRS = array<vec3<i32>, 6>(
-  vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0),
-  vec3<i32>(0, 1, 0), vec3<i32>(0, -1, 0),
-  vec3<i32>(0, 0, 1), vec3<i32>(0, 0, -1),
-);
+${NEIGHBOR_CULL}
 
 const MAXV: u32 = 128u; // local unique-vertex table; templates above this fall back to 3/tri
 
@@ -84,16 +152,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (slot != 255u) {
       let s = slot;
       if (!nbKnown[s]) {
-        var culled = false;
-        let nx = vec3<i32>(cell) + DIRS[s];
-        if (nx.x >= 0 && nx.y >= 0 && nx.z >= 0 && nx.x < i32(sx) && nx.y < i32(sy) && nx.z < i32(sz)) {
-          let nu = vec3<u32>(nx);
-          let nv = grid[(nu.y * sz + nu.z) * sx + nu.x];
-          if (nv != 0u) {
-            if (desc2[nv].z == category && (desc[nv].w & (1u << s)) != 0u) { culled = true; }
-          }
-        }
-        nbKnown[s] = true; nbCulled[s] = culled;
+        nbKnown[s] = true; nbCulled[s] = neighborOccludes(cell, s, d0.w);
       }
       if (nbCulled[s]) { continue; }
     }
@@ -204,60 +263,101 @@ type PaletteEntry = {
 	index: number;
 	category: string;
 	occlusionFlags: number;
+	fluid?: "water" | "lava";
 	geometries: Array<{
 		positions: Float32Array | number[];
 		normals: Float32Array | number[];
 		uvs: Float32Array | number[];
-		indices: Uint32Array | Uint16Array | number[];
+		indices: Uint32Array | Uint16Array | number[] | null;
 		materialIndex: number;
+		category?: string;
 	}>;
 };
-
-const E = 0.01;
-const slotOf = (dx: number, dy: number, dz: number) =>
-	dx === 1 ? 0 : dx === -1 ? 1 : dy === 1 ? 2 : dy === -1 ? 3 : dz === 1 ? 4 : dz === -1 ? 5 : 255;
 
 export class GpuMeshBuilder {
 	private device: GPUDevice | null = null;
 	private pipeline: GPUComputePipeline | null = null;
-	private module: GPUShaderModule | null = null;
+	private recordPipeline: GPUComputePipeline | null = null;
+	private generation = 0;
 	available = false;
 
+	/** Each schematic owns its compute device; release it when the schematic is removed. */
+	dispose(): void {
+		this.generation++;
+		this.available = false;
+		this.pipeline = null;
+		this.recordPipeline = null;
+		this.device?.destroy();
+		this.device = null;
+	}
+
 	async init(): Promise<boolean> {
-		if (this.device) return true;
+		if (this.device && this.available) return true;
+		const generation = this.generation;
 		if (typeof navigator !== "undefined" && (navigator as any).gpu) {
 			try {
 				const adapter = await (navigator as any).gpu.requestAdapter();
-				if (!adapter) return false;
+				if (!adapter || generation !== this.generation) return false;
+				const storageLimit = adapter.limits.maxStorageBuffersPerShaderStage;
+				if (storageLimit < 8) return false;
 				const device: GPUDevice = await adapter.requestDevice({
 					requiredLimits: {
-						// the shader binds 16 storage buffers (0, 2..16). Request EXACTLY that:
-						// if the adapter can't provide it, requestDevice rejects and the caller
-						// falls back to batched — requesting the adapter's own limit instead
-						// would succeed and then silently dispatch nothing (invalid pipeline)
-						maxStorageBuffersPerShaderStage: 16, // adapter max here; bindings 0,2..16 fit exactly
+						// The record path runs on the minimum eight-buffer WebGPU limit.
+						// Devices with sixteen buffers retain the direct vertex-output path.
+						maxStorageBuffersPerShaderStage: storageLimit >= 16 ? 16 : 8,
 						// large builds need big output buffers (3.1M blocks -> ~360MB positions)
 						maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
 						maxBufferSize: adapter.limits.maxBufferSize,
 					},
 				});
-				this.device = device;
-				this.module = device.createShaderModule({ code: SHADER });
-				const info = await (this.module as any).getCompilationInfo();
-				for (const m of info.messages) {
-					if (m.type === "error" || m.type === "warning")
-						console.warn(`[GpuMeshBuilder][wgsl:${m.type}] line ${m.lineNum}: ${m.message}`);
+				if (generation !== this.generation) {
+					device.destroy();
+					return false;
 				}
-				device.lost.then((i: any) =>
-					console.warn("[GpuMeshBuilder] device lost:", i?.reason, i?.message)
-				);
-				this.pipeline = device.createComputePipeline({
-					layout: "auto",
-					compute: { module: this.module, entryPoint: "main" },
+				this.device = device;
+				device.lost.then((i: any) => {
+					if (this.device === device) {
+						this.available = false;
+						this.device = null;
+						this.pipeline = null;
+						this.recordPipeline = null;
+						console.warn("[GpuMeshBuilder] device lost:", i?.reason, i?.message);
+					}
 				});
+				const compile = async (code: string) => {
+					const module = device.createShaderModule({ code });
+					const info = await module.getCompilationInfo();
+					for (const m of info.messages) {
+						if (m.type === "error" || m.type === "warning")
+							console.warn(`[GpuMeshBuilder][wgsl:${m.type}] line ${m.lineNum}: ${m.message}`);
+					}
+					if (info.messages.some((m) => m.type === "error"))
+						throw new Error("Invalid GPU mesher shader");
+					return device.createComputePipelineAsync({
+						layout: "auto",
+						compute: { module, entryPoint: "main" },
+					});
+				};
+				const recordPipeline = await compile(RECORD_SHADER);
+				if (generation !== this.generation || this.device !== device) return false;
+				this.recordPipeline = recordPipeline;
+				if (storageLimit >= 16) {
+					try {
+						const vertexPipeline = await compile(SHADER);
+						if (generation !== this.generation || this.device !== device) return false;
+						this.pipeline = vertexPipeline;
+					} catch (error) {
+						console.warn(
+							"[GpuMeshBuilder] Direct vertex pipeline unavailable; expanding GPU records instead",
+							error
+						);
+					}
+				}
+				if (generation !== this.generation || this.device !== device) return false;
 				this.available = true;
 				return true;
 			} catch (e) {
+				if (generation === this.generation) this.dispose();
 				console.warn("[GpuMeshBuilder] WebGPU init failed, falling back:", e);
 				return false;
 			}
@@ -322,7 +422,7 @@ export class GpuMeshBuilder {
 				const gTriBase = tplCull.length; // this geometry's triangle rows start here
 				const pos = g.positions,
 					nrm = g.normals || [],
-					idx = g.indices;
+					idx = g.indices ?? Array.from({ length: pos.length / 3 }, (_, i) => i);
 				for (let v = 0; v < pos.length; v++) tplPos.push(pos[v]);
 				const uv = g.uvs || [];
 				for (let v = 0; v < nrm.length; v++) tplNrm.push(nrm[v]);
@@ -342,27 +442,8 @@ export class GpuMeshBuilder {
 				while (tplUv.length < (tplPos.length / 3) * 2) tplUv.push(0);
 				for (let i = 0; i < idx.length; i++) tplIdx.push(vBase + idx[i]);
 				for (let tr = 0; tr + 2 < idx.length; tr += 3) {
-					const i0 = idx[tr];
-					let cull = 255;
-					if (nrm.length > i0 * 3 + 2) {
-						const dx = Math.round(nrm[i0 * 3]),
-							dy = Math.round(nrm[i0 * 3 + 1]),
-							dz = Math.round(nrm[i0 * 3 + 2]);
-						if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) === 1) {
-							const v0x = pos[i0 * 3],
-								v0y = pos[i0 * 3 + 1],
-								v0z = pos[i0 * 3 + 2];
-							const flush =
-								(dx === 1 && (Math.abs(v0x - 1) < E || Math.abs(v0x - 0.5) < E)) ||
-								(dx === -1 && (Math.abs(v0x) < E || Math.abs(v0x + 0.5) < E)) ||
-								(dy === 1 && (Math.abs(v0y - 1) < E || Math.abs(v0y - 0.5) < E)) ||
-								(dy === -1 && (Math.abs(v0y) < E || Math.abs(v0y + 0.5) < E)) ||
-								(dz === 1 && (Math.abs(v0z - 1) < E || Math.abs(v0z - 0.5) < E)) ||
-								(dz === -1 && (Math.abs(v0z) < E || Math.abs(v0z + 0.5) < E));
-							if (flush) cull = slotOf(dx, dy, dz);
-						}
-					}
-					tplCull.push(cull);
+					const direction = templateCullDirection(g, tr);
+					tplCull.push(direction < 0 ? 255 : direction);
 					tplTriMat.push(gMat);
 				}
 				// mark in-geometry quad pairs (t even offsets): rows (2k, 2k+1)
@@ -394,7 +475,8 @@ export class GpuMeshBuilder {
 					else if (rot(t1, v, x, u) && rot(t2, v, u, g4)) quadStart.set(r0, [v, x, u, g4]);
 				}
 			}
-			desc.push([vertStart, idxStart, triStart, t.occlusionFlags]);
+			const fluidFlag = t.fluid === "water" ? 64 : t.fluid === "lava" ? 128 : 0;
+			desc.push([vertStart, idxStart, triStart, (t.occlusionFlags & 63) | fluidFlag]);
 			desc2.push([
 				tplPos.length / 3 - vertStart,
 				tplIdx.length - idxStart,
@@ -437,7 +519,20 @@ export class GpuMeshBuilder {
 	): Promise<THREE.Mesh[]> {
 		// A glass/portal-only schematic is rendered entirely by the surface pass.
 		if (palette.length === 0) return [];
-		if (!this.device || !this.pipeline) throw new Error("GpuMeshBuilder not initialized");
+		if (!this.device || !this.recordPipeline) throw new Error("GpuMeshBuilder not initialized");
+		if (!this.pipeline) {
+			const { stream } = await this.buildRecordMeshes(
+				grid,
+				sx,
+				sy,
+				sz,
+				palette,
+				materialLookup,
+				false
+			);
+			const { materializeRecordMeshes } = await import("./RecordRenderer");
+			return stream ? materializeRecordMeshes(stream) : [];
+		}
 		const device = this.device;
 		const t0 = performance.now();
 
@@ -940,10 +1035,13 @@ export class GpuMeshBuilder {
 		sy: number,
 		sz: number,
 		palette: PaletteEntry[],
-		materialLookup: (category: string) => THREE.Material[]
-	): Promise<{ meshes: import("three").Mesh[]; stream: any }> {
+		materialLookup: (category: string) => THREE.Material[],
+		makeDrawingMeshes = true
+	): Promise<{ meshes: THREE.Mesh[]; stream: RecordStream | null }> {
 		if (palette.length === 0) return { meshes: [], stream: null };
-		const device = this.device!;
+		if (!this.device || !this.recordPipeline) throw new Error("GpuMeshBuilder not initialized");
+		const device = this.device;
+		const pipeline = this.recordPipeline;
 		const t0 = performance.now();
 		const {
 			catNames,
@@ -971,16 +1069,12 @@ export class GpuMeshBuilder {
 			device.queue.writeBuffer(b, 0, arr.buffer, arr.byteOffset, arr.byteLength);
 			return b;
 		};
-		const bufs: any = {
+		const bufs = {
 			grid: mk(grid, GPUBufferUsage.STORAGE),
 			desc: mk(new Uint32Array(desc), GPUBufferUsage.STORAGE),
 			desc2: mk(new Uint32Array(desc2), GPUBufferUsage.STORAGE),
-			tp: mk(new Float32Array(tplPos), GPUBufferUsage.STORAGE),
-			ti: mk(new Uint32Array(tplIdx), GPUBufferUsage.STORAGE),
 			tc: mk(new Uint32Array(tplCull), GPUBufferUsage.STORAGE),
 			tm: mk(new Uint32Array(tplTriMat), GPUBufferUsage.STORAGE),
-			tn: mk(new Float32Array(tplNrm), GPUBufferUsage.STORAGE),
-			tu: mk(new Float32Array(tplUv), GPUBufferUsage.STORAGE),
 			co: mk(new Uint32Array(2 * nSlots), GPUBufferUsage.STORAGE),
 		};
 		const dims = mk(
@@ -1005,30 +1099,20 @@ export class GpuMeshBuilder {
 			countersRead.unmap();
 			return c;
 		};
-		const dummies = Array.from({ length: 5 }, () =>
-			device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
-		);
+		const outRecDummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
 		const mkBind = (outRec: GPUBuffer) =>
 			device.createBindGroup({
-				layout: this.pipeline!.getBindGroupLayout(0),
+				layout: pipeline.getBindGroupLayout(0),
 				entries: [
 					{ binding: 0, resource: { buffer: bufs.grid } },
 					{ binding: 1, resource: { buffer: dims } },
 					{ binding: 2, resource: { buffer: bufs.desc } },
 					{ binding: 3, resource: { buffer: bufs.desc2 } },
-					{ binding: 4, resource: { buffer: bufs.tp } },
-					{ binding: 5, resource: { buffer: bufs.ti } },
-					{ binding: 6, resource: { buffer: bufs.tc } },
-					{ binding: 7, resource: { buffer: dummies[0] } },
-					{ binding: 8, resource: { buffer: dummies[1] } },
-					{ binding: 9, resource: { buffer: counters } },
-					{ binding: 10, resource: { buffer: bufs.co } },
-					{ binding: 11, resource: { buffer: bufs.tm } },
-					{ binding: 12, resource: { buffer: outRec } },
-					{ binding: 13, resource: { buffer: bufs.tn } },
-					{ binding: 14, resource: { buffer: bufs.tu } },
-					{ binding: 15, resource: { buffer: dummies[2] } },
-					{ binding: 16, resource: { buffer: dummies[3] } },
+					{ binding: 4, resource: { buffer: bufs.tc } },
+					{ binding: 5, resource: { buffer: counters } },
+					{ binding: 6, resource: { buffer: bufs.co } },
+					{ binding: 7, resource: { buffer: bufs.tm } },
+					{ binding: 8, resource: { buffer: outRec } },
 				],
 			});
 		const wx = Math.ceil(sx / 4),
@@ -1037,7 +1121,7 @@ export class GpuMeshBuilder {
 			device.queue.writeBuffer(dims, 0, new Uint32Array([sx, sy, sz, mode, nSlots, y0, h, 0]));
 			const enc = device.createCommandEncoder();
 			const pass = enc.beginComputePass();
-			pass.setPipeline(this.pipeline!);
+			pass.setPipeline(pipeline);
 			pass.setBindGroup(0, mkBind(outRec));
 			pass.dispatchWorkgroups(wx, Math.ceil(h / 4), wz);
 			pass.end();
@@ -1046,20 +1130,15 @@ export class GpuMeshBuilder {
 		};
 		const zeroCounters = () => device.queue.writeBuffer(counters, 0, new Uint32Array(nSlots * 2));
 
-		const outRecDummy = dummies[4];
 		try {
 			// SPATIAL CHUNKING (Opus perf round 2): emit per Y-slab (16 layers) so each
 			// record chunk has a real bounding volume — frustum culling becomes possible
 			// and three's opaque sort gives front-to-back (early-Z recovery). Records are
 			// tiny, so per-slab count+emit passes are cheap.
 			const SLAB = 16;
-			const perCategory: {
-				category: string;
-				records: Uint32Array;
-				tris: number;
-				y0: number;
-				h: number;
-			}[] = [];
+			const { buildRecordTables, makeRecordMeshes, splitRecordMaterialRuns } =
+				await import("./RecordRenderer");
+			const perCategory: RecordMaterialRun[] = [];
 			for (let y0 = 0; y0 < sy; y0 += SLAB) {
 				const h = Math.min(SLAB, sy - y0);
 				zeroCounters();
@@ -1099,11 +1178,16 @@ export class GpuMeshBuilder {
 					const rec = new Uint32Array(tmp.getMappedRange().slice(0));
 					tmp.unmap();
 					tmp.destroy();
-					perCategory.push({ category: catNames[c], records: rec, tris: nTris, y0, h });
+					const counts = Array.from(
+						{ length: catMatCount[c] },
+						(_, s) => cnt[(slotBase[c] + s) * 2 + 1]
+					);
+					perCategory.push(
+						...splitRecordMaterialRuns(rec, counts, materialLookup(catNames[c]), catNames[c], y0, h)
+					);
 				}
 				outRec.destroy();
 			}
-			const { buildRecordTables, makeRecordMeshes } = await import("./RecordRenderer");
 			const tables = buildRecordTables(
 				tplPos,
 				tplNrm,
@@ -1116,15 +1200,6 @@ export class GpuMeshBuilder {
 				tplNrmW,
 				tplUvW
 			);
-			const mats0 = materialLookup(catNames[0] ?? "solid");
-			const atlas = (mats0?.[0] as any)?.map ?? null;
-			// quad-pair predicate: template rows r,r+1 of the same state with corner ids
-			// [a,b,c]+[a,c,d] (4 unique) merge to one quad; corner order reproduces both
-			// triangles via the static [0,1,2, 0,2,3] pattern
-			const maxIdx = desc2.length / 4 - 1;
-			const rowState = new Uint32Array(tplCull.length);
-			for (let pi = 1; pi <= maxIdx; pi++)
-				for (let r = 0; r < desc2[pi * 4 + 1] / 3; r++) rowState[desc[pi * 4 + 2] + r] = pi;
 
 			// quad merge via the TEMPLATE-PRECOMPUTED quadStart map (same-geometry pairs only —
 			// the runtime predicate's cross-element pairings were the corruption source)
@@ -1132,23 +1207,20 @@ export class GpuMeshBuilder {
 				const corners = quadStart.get(rowA);
 				return corners ? { quad: true, corners } : { quad: false, corners: null };
 			};
-			const meshes = makeRecordMeshes({ perCategory, tables, sx, sy, sz }, atlas, quadStartLookup);
+			const stream = { perCategory, tables, sx, sy, sz };
+			const meshes = makeDrawingMeshes ? makeRecordMeshes(stream, null, quadStartLookup) : [];
 			console.log(
 				`[GpuMeshBuilder][pull] ${perCategory.reduce((a, p) => a + p.tris, 0).toLocaleString()} tris → ${meshes.length} pulling meshes in ${(performance.now() - t0).toFixed(0)}ms (readback ${(perCategory.reduce((a, p) => a + p.tris * 8, 0) / 1048576).toFixed(1)}MB)`
 			);
-			return { meshes, stream: { perCategory, tables, sx, sy, sz } };
+			return { meshes, stream };
 		} finally {
 			[
-				...dummies,
+				outRecDummy,
 				bufs.grid,
 				bufs.desc,
 				bufs.desc2,
-				bufs.tp,
-				bufs.ti,
 				bufs.tc,
 				bufs.tm,
-				bufs.tn,
-				bufs.tu,
 				bufs.co,
 				dims,
 				counters,

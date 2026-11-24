@@ -29,6 +29,9 @@ export declare class Cubane {
     private blockMeshCache;
     private entityMeshCache;
     private optimizationDataCache;
+    private meshCacheGeneration;
+    private meshAssetGeneration;
+    private disposed;
     private pureBlockEntityMap;
     private getShulkerBoxEntityMap;
     private hybridBlockConfig;
@@ -221,6 +224,7 @@ export declare class Cubane {
      * Clear all mesh caches
      */
     clearMeshCaches(): void;
+    private getMeshCacheGeneration;
     /**
      * Clear block mesh cache only
      */

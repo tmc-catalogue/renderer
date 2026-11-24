@@ -1,1 +1,1 @@
-{"version":3,"file":"SurfaceSorting.d.ts","sourceRoot":"","sources":["../../src/meshing/SurfaceSorting.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,KAAK,MAAM,OAAO,CAAC;AAE/B,sFAAsF;AACtF,wBAAgB,qBAAqB,CAAC,IAAI,EAAE,KAAK,CAAC,IAAI,EAAE,OAAO,EAAE,YAAY,GAAG,IAAI,CAgEnF"}
+{"version":3,"file":"SurfaceSorting.d.ts","sourceRoot":"","sources":["../../src/meshing/SurfaceSorting.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,KAAK,MAAM,OAAO,CAAC;AAE/B,sFAAsF;AACtF,wBAAgB,qBAAqB,CACpC,IAAI,EAAE,KAAK,CAAC,IAAI,EAChB,OAAO,EAAE,YAAY,EACrB,mBAAmB,UAAQ,GACzB,IAAI,CAmEN"}

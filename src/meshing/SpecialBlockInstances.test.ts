@@ -12,12 +12,17 @@ function cachedStatue() {
 	const cubane = Object.assign(Object.create(Cubane.prototype), {
 		initialized: true,
 		blockMeshCache: new Map(),
-		assetLoader: { getTexture: async () => texture },
+		meshCacheGeneration: 0,
+		meshAssetGeneration: 0,
+		assetLoader: { getTexture: async () => texture, getResourceGeneration: () => 0 },
 		signRenderer: { isSign: () => false },
 	}) as Cubane;
 	return { cubane, texture };
 }
-async function schematic(cubane: Pick<Cubane, "getBlockMesh">) {
+async function schematic(
+	cubane: Pick<Cubane, "getBlockMesh">,
+	entityCells = [{ x: 0, y: 0, z: 0, block: state }]
+) {
 	const object: any = Object.assign(Object.create(SchematicObject.prototype), {
 		group: new THREE.Group(),
 		opacity: 1,
@@ -37,7 +42,7 @@ async function schematic(cubane: Pick<Cubane, "getBlockMesh">) {
 			sx: 1,
 			sy: 1,
 			sz: 1,
-			entityCells: [{ x: 0, y: 0, z: 0, block: state }],
+			entityCells,
 		}),
 	});
 	const result = await object.buildSchematicMeshesGpuPull(object);
@@ -51,6 +56,32 @@ function material(mesh: THREE.Mesh): THREE.MeshStandardMaterial {
 }
 
 describe("special-block schematic ownership", () => {
+	it("keeps redstone power state and asymmetric block-local positions", async () => {
+		const dark = "minecraft:redstone_wire[north=side,power=0]";
+		const bright = "minecraft:redstone_wire[north=side,power=15]";
+		const getBlockMesh = vi.fn(async (state: string) => {
+			const root = new THREE.Group();
+			const geometry = new THREE.BoxGeometry(1, 0.01, 0.5).translate(0, -0.48, -0.25);
+			const material = new THREE.MeshStandardMaterial({
+				color: state === bright ? 0xff0000 : 0x500000,
+			});
+			root.add(new THREE.Mesh(geometry, material));
+			return root;
+		});
+		const { object } = await schematic({ getBlockMesh }, [
+			{ x: 0, y: 0, z: 0, block: dark },
+			{ x: 1, y: 0, z: 0, block: bright },
+		]);
+		expect(getBlockMesh).toHaveBeenCalledWith(dark, "plains", true);
+		expect(getBlockMesh).toHaveBeenCalledWith(bright, "plains", true);
+		expect(object.meshes.map((m: THREE.Mesh) => material(m).color.getHex())).toEqual([
+			0x500000, 0xff0000,
+		]);
+		const geometry = object.meshes[0].geometry as THREE.BufferGeometry;
+		geometry.computeBoundingBox();
+		expect(geometry.boundingBox!.getCenter(new THREE.Vector3()).z).toBeCloseTo(-0.25);
+		expect(geometry.boundingBox!.getCenter(new THREE.Vector3()).y).toBeCloseTo(-0.48);
+	});
 	it("fades one schematic without changing another schematic or the cached statue", async () => {
 		const { cubane, texture } = cachedStatue();
 		const cached = (await cubane.getBlockMesh(state)).children[0] as THREE.Mesh;

@@ -69,6 +69,9 @@ function fixture(modern = false) {
 	});
 	const signs = new SignRenderer(assets);
 	const cubane = Object.assign(Object.create(Cubane.prototype), {
+		assetLoader: assets,
+		meshCacheGeneration: 0,
+		meshAssetGeneration: assets.getResourceGeneration(),
 		signRenderer: signs,
 		blockMeshCache: new Map(),
 		entityMeshCache: new Map(),

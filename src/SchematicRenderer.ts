@@ -17,8 +17,10 @@ import { shouldRenderFrame, pickFrameSchedule, scheduleDelayMs } from "./utils/r
 import { RenderLoopScheduler } from "./utils/renderLoopScheduler";
 import { SchematicManager, SchematicManagerOptions } from "./managers/SchematicManager";
 import { WorldMeshBuilder } from "./WorldMeshBuilder";
-import { MaterialRegistry } from "./MaterialRegistry";
-import { initializeResourcePacks } from "./utils/initializeResourcePacks";
+import {
+	initializeResourcePacks,
+	reloadEnabledResourcePacks,
+} from "./utils/initializeResourcePacks";
 import { EventEmitter } from "events";
 import { ResourcePackManager, DefaultPackCallback } from "./managers/ResourcePackManager";
 import { ResourcePackManagerProxy } from "./managers/ResourcePackManagerProxy";
@@ -35,6 +37,8 @@ import type {
 	LoadCompleteEvent,
 	LoadErrorEvent,
 	PackErrorEvent,
+	PackEventType,
+	PackEventHandler,
 } from "./types/resourcePack";
 
 import { GizmoManager } from "./managers/GizmoManager";
@@ -84,6 +88,7 @@ export class SchematicRenderer {
 	public timings: Map<string, number> = new Map();
 	public fps: number = 0;
 	private resourcePackManager: ResourcePackManager;
+	private packUnsubscribers: (() => void)[] = [];
 	public packs!: ResourcePackManagerProxy;
 	/** Unified sidebar UI manager */
 	public sidebar: SidebarManager | undefined;
@@ -146,7 +151,9 @@ export class SchematicRenderer {
 		this.eventEmitter.emit("sceneReady");
 
 		// Initialize ResourcePackManager with options
-		this.resourcePackManager = new ResourcePackManager(this.options.resourcePackOptions);
+		this.resourcePackManager =
+			this.options.context?.resourcePackManager ??
+			new ResourcePackManager(this.options.resourcePackOptions);
 
 		// Create proxy for external API access
 		this.packs = new ResourcePackManagerProxy(this.resourcePackManager);
@@ -490,133 +497,80 @@ export class SchematicRenderer {
 	private setupResourcePackCallbacks(): void {
 		const callbacks = this.options.callbacks;
 		const rpCallbacks = this.options.resourcePackOptions;
+		const subscribe = <T extends PackEventType>(event: T, handler: PackEventHandler<T>) => {
+			this.resourcePackManager.on(event, handler);
+			this.packUnsubscribers.push(() => this.resourcePackManager.offPackEvent(event, handler));
+		};
 
 		// Pack changed events
-		this.resourcePackManager.on("packsChanged", (event: PacksChangedEvent) => {
+		subscribe("packsChanged", (event: PacksChangedEvent) => {
 			callbacks?.onPacksChanged?.(event.reason);
 			rpCallbacks?.onPacksChanged?.(event);
 		});
 
 		// Pack toggled events
-		this.resourcePackManager.on("packToggled", (event: PackToggledEvent) => {
+		subscribe("packToggled", (event: PackToggledEvent) => {
 			callbacks?.onPackToggled?.(event.packId, event.enabled);
 			rpCallbacks?.onPackToggled?.(event.packId, event.enabled);
 		});
 
 		// Atlas rebuild events
-		this.resourcePackManager.on("atlasRebuilt", (event: { textureCount: number }) => {
+		subscribe("atlasRebuilt", (event: { textureCount: number }) => {
 			callbacks?.onAtlasRebuilt?.(event.textureCount);
 			rpCallbacks?.onAtlasRebuilt?.();
 		});
 
 		// Pack added events
-		this.resourcePackManager.on("packAdded", (event: PackAddedEvent) => {
+		subscribe("packAdded", (event: PackAddedEvent) => {
 			rpCallbacks?.onPackAdded?.(event);
 		});
 
 		// Pack removed events
-		this.resourcePackManager.on("packRemoved", (event: PackRemovedEvent) => {
+		subscribe("packRemoved", (event: PackRemovedEvent) => {
 			rpCallbacks?.onPackRemoved?.(event.packId);
 		});
 
 		// Load progress events
-		this.resourcePackManager.on("loadProgress", (event: LoadProgressEvent) => {
+		subscribe("loadProgress", (event: LoadProgressEvent) => {
 			rpCallbacks?.onLoadProgress?.(event);
 		});
 
 		// Load complete events
-		this.resourcePackManager.on("loadComplete", (event: LoadCompleteEvent) => {
+		subscribe("loadComplete", (event: LoadCompleteEvent) => {
 			rpCallbacks?.onLoadComplete?.(event);
 		});
 
 		// Load error events
-		this.resourcePackManager.on("loadError", (event: LoadErrorEvent) => {
+		subscribe("loadError", (event: LoadErrorEvent) => {
 			rpCallbacks?.onLoadError?.(event);
 		});
 
 		// Error events
-		this.resourcePackManager.on("error", (event: PackErrorEvent) => {
+		subscribe("error", (event: PackErrorEvent) => {
 			rpCallbacks?.onError?.(event);
 		});
 
 		// Set atlas rebuild callback to reload resources
 		// This is called when packs are toggled/changed, so always force reload
-		this.resourcePackManager.setAtlasRebuildCallback(async () => {
-			// Initial defaults are reconciled in one batch after cache restoration.
-			if (!this.resourcePacksInitialized) return;
-			console.log("[SchematicRenderer] Atlas rebuild callback invoked - forcing reload");
-			await this.reloadResourcePacksIntoCubane(true); // Force reload when packs change
-		});
+		if (!this.options.context)
+			this.resourcePackManager.setAtlasRebuildCallback(async () => {
+				// Initial defaults are reconciled in one batch after cache restoration.
+				if (!this.resourcePacksInitialized) return;
+				console.log("[SchematicRenderer] Atlas rebuild callback invoked - forcing reload");
+				await reloadEnabledResourcePacks(this.cubane, this.resourcePackManager);
+				await this.refreshResourceAssets();
+			});
 	}
 
-	/**
-	 * Reload all enabled resource packs into Cubane
-	 * @param force - Force reload even if Cubane already has packs loaded
-	 */
-	private async reloadResourcePacksIntoCubane(force: boolean = false): Promise<void> {
-		if (!this.cubane) return;
-
-		try {
-			const enabledPacks = this.resourcePackManager.getEnabledPacksWithBlobs();
-
-			// Only skip on initial load (not forced) if Cubane already has the same number of packs
-			if (!force) {
-				const cubanePackCount = this.cubane.getPackCount?.() ?? 0;
-				if (cubanePackCount > 0 && cubanePackCount >= enabledPacks.length) {
-					console.log(
-						`[SchematicRenderer] Cubane already has ${cubanePackCount} pack(s) loaded, skipping reload`
-					);
-					return;
-				}
-			}
-
-			// IMPORTANT: In Cubane/Minecraft, packs loaded LAST override earlier packs.
-			// Our priority system: lower number = higher priority = should override others.
-			// So we need to REVERSE the order: load low-priority packs first, high-priority last.
-			const packsToLoad = [...enabledPacks].reverse();
-
-			console.log(
-				`[SchematicRenderer] Reloading ${packsToLoad.length} resource pack(s) into Cubane...`
-			);
-
-			// Use batch mode to clear and reload all packs at once (single atlas rebuild at end)
-			this.cubane.beginPackBatchUpdate();
-
-			try {
-				// Clear existing packs first (important when packs are disabled)
-				await this.cubane.removeAllPacks();
-
-				// Load enabled packs
-				for (const pack of packsToLoad) {
-					try {
-						await this.cubane.loadResourcePack(pack.blob);
-						console.log(`  ✓ Loaded: ${pack.name}`);
-					} catch (error) {
-						console.error(`  ✗ Failed to load pack ${pack.name}:`, error);
-					}
-				}
-			} finally {
-				// End batch mode - this triggers a single atlas rebuild with all packs
-				await this.cubane.endPackBatchUpdate();
-			}
-
-			// Clear MaterialRegistry cache so new textures are used
-			MaterialRegistry.clear();
-
-			// Invalidate WorldMeshBuilder cache so new textures are used
-			if (this.worldMeshBuilder) {
-				this.worldMeshBuilder.invalidateCache();
-			}
-
-			// Rebuild all loaded schematics with new textures
-			await this.rebuildAllSchematics();
-
-			// Trigger event for external listeners
-			this.eventEmitter.emit("resourcePacksReloaded");
-			console.log("Resource pack reload complete");
-		} catch (error) {
-			console.error("Failed to reload resource packs into Cubane:", error);
-		}
+	/** Refresh meshes after the owning asset pipeline has rebuilt its atlas. */
+	public async refreshResourceAssets(): Promise<void> {
+		if (this.isDisposed) return;
+		this.worldMeshBuilder?.invalidateCache();
+		this.materialMap.clear();
+		await this.rebuildAllSchematics();
+		this.updateMissingPackNotice();
+		this.eventEmitter.emit("resourcePacksReloaded");
+		this.invalidate();
 	}
 
 	/**
@@ -1242,29 +1196,6 @@ export class SchematicRenderer {
 		await this.resourcePackManager.uploadPack(file);
 
 		if (this.options.enableProgressBar && this.uiManager) {
-			this.uiManager.updateProgress(0.3, "Loading into Cubane...");
-		}
-
-		// Also load directly into Cubane for immediate use
-		try {
-			await this.cubane.loadResourcePack(file);
-			await (this.cubane.getAssetLoader() as any).buildTextureAtlas?.();
-		} catch (error) {
-			console.error("Failed to load new resource pack into Cubane:", error);
-		}
-
-		if (this.options.enableProgressBar && this.uiManager) {
-			this.uiManager.updateProgress(0.6, "Rebuilding meshes...");
-		}
-
-		// Rebuild world meshes if needed
-		if (this.worldMeshBuilder && this.schematicManager) {
-			// for (const schematic of this.schematicManager.getAllSchematics()) {
-			// 	await this.worldMeshBuilder.rebuildSchematic(schematic.id);
-			// }
-		}
-
-		if (this.options.enableProgressBar && this.uiManager) {
 			this.uiManager.updateProgress(1.0, "Resource pack added");
 			setTimeout(() => this.uiManager?.hideProgressBar(), 500);
 		}
@@ -1280,8 +1211,11 @@ export class SchematicRenderer {
 			this.uiManager.updateProgress(0.2, `${actionText} ${name}...`);
 		}
 
-		await this.resourcePackManager.togglePackEnabled(name, enabled);
-		await this.reloadResources();
+		try {
+			await this.resourcePackManager.togglePackEnabled(name, enabled);
+		} finally {
+			if (this.options.enableProgressBar) this.uiManager?.hideProgressBar();
+		}
 	}
 
 	public async removeResourcePack(name: string): Promise<void> {
@@ -1291,51 +1225,11 @@ export class SchematicRenderer {
 			this.uiManager.updateProgress(0.2, `Removing ${name}...`);
 		}
 
-		await this.resourcePackManager.removePack(name);
-		await this.reloadResources();
-	}
-
-	private async reloadResources(): Promise<void> {
-		// Show progress bar for resource reload
-		if (this.options.enableProgressBar && this.uiManager) {
-			this.uiManager.showProgressBar("Reloading resources...");
-			this.uiManager.updateProgress(0.2, "Processing resource packs...");
+		try {
+			await this.resourcePackManager.removePack(name);
+		} finally {
+			if (this.options.enableProgressBar) this.uiManager?.hideProgressBar();
 		}
-
-		// Clear Cubane's existing resources
-		this.cubane.dispose();
-		this.cubane = new Cubane({
-			showUnknownBlocks: this.options.debugOptions?.showUnknownBlocks,
-		}); // Recreate fresh instance
-
-		// Reinitialize resource packs in Cubane
-		await this.initializeResourcePacks();
-		this.updateMissingPackNotice();
-
-		if (this.options.enableProgressBar && this.uiManager) {
-			this.uiManager.updateProgress(0.5, "Loading textures and models...");
-		}
-
-		// Rebuild world meshes with new resources
-		if (this.worldMeshBuilder && this.schematicManager) {
-			this.uiManager?.updateProgress(0.7, "Rebuilding schematic meshes...");
-
-			// Trigger rebuild of all schematic meshes
-			// for (const schematic of this.schematicManager.getAllSchematics()) {
-			// 	await this.worldMeshBuilder.rebuildSchematic(schematic.id);
-			// }
-		}
-
-		if (this.options.enableProgressBar && this.uiManager) {
-			this.uiManager.updateProgress(1.0, "Resources loaded");
-
-			// Hide progress bar after a short delay
-			setTimeout(() => {
-				this.uiManager?.hideProgressBar();
-			}, 500);
-		}
-
-		this.materialMap.clear();
 	}
 
 	/**
@@ -1761,6 +1655,7 @@ export class SchematicRenderer {
 	}
 
 	public dispose(): void {
+		if (this.isDisposed) return;
 		// Mark as disposed to stop animation loop
 		this.isDisposed = true;
 
@@ -1792,28 +1687,29 @@ export class SchematicRenderer {
 			this.regionInteractionHandler = undefined;
 		}
 
-		if (!this.renderManager) {
-			return;
-		}
-		if (!this.highlightManager) {
-			return;
-		}
-		if (!this.uiManager) {
-			return;
-		}
-
-		this.highlightManager.dispose();
-		this.renderManager.renderer.dispose();
+		this.highlightManager?.dispose();
+		this.interactionManager?.dispose();
+		this.gizmoManager?.dispose();
+		this.overlayManager?.dispose();
+		this.timer.dispose();
+		// Cancel staged work on all schematics before terminating workers. Shared
+		// WebGL renderers are owned by the context; RenderManager knows that boundary.
+		for (const schematic of this.schematicManager?.schematics.values() ?? [])
+			void schematic.dispose();
+		this.schematicManager?.schematics.clear();
+		this.worldMeshBuilder?.dispose();
+		this.renderManager?.dispose();
 		this.dragAndDropManager?.dispose();
 		this.resourcePackNotice?.dispose();
-		this.uiManager.dispose();
+		this.uiManager?.dispose();
 		this.cameraManager.dispose();
 
 		// Clean up sidebar UI
 		this.sidebar?.dispose();
 
 		// Clean up resource pack manager
-		this.resourcePackManager.dispose();
+		this.packUnsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
+		if (!this.options.context) this.resourcePackManager.dispose();
 
 		// Clean up Cubane resources. When using a shared context, the Cubane is owned
 		// by the context (and shared with other renderers) — just detach, don't dispose.

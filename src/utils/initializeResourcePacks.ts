@@ -1,6 +1,21 @@
 import type { Cubane } from "../cubane/Cubane";
 import type { DefaultPackCallback, ResourcePackManager } from "../managers/ResourcePackManager";
 
+/** Rebuild in place: mesh builders keep their Cubane reference for their lifetime. */
+export async function reloadEnabledResourcePacks(
+	cubane: Cubane,
+	manager: ResourcePackManager
+): Promise<void> {
+	const desired = [...manager.getEnabledPacksWithBlobs()].reverse();
+	cubane.beginPackBatchUpdate();
+	try {
+		await cubane.removeAllPacks();
+		for (const pack of desired) await cubane.loadResourcePack(pack.blob);
+	} finally {
+		await cubane.endPackBatchUpdate();
+	}
+}
+
 /** Reconcile persisted packs without rebuilding an already matching cached atlas. */
 export async function initializeResourcePacks(
 	cubane: Cubane,

@@ -42,6 +42,9 @@ npm install github:worldInColors/renderer
 # pnpm and yarn work the same way — no build-script allowlist needed anymore
 ```
 
+In Node.js, `import` and `require()` share the same renderer module and Nucleation WASM instance.
+`require()` needs Node.js 20.19 or later on the 20.x line, or Node.js 22.12 or later.
+
 The WASM mesher is bundled inline (async-chunked) — no `.wasm` asset
 configuration, works in Vite dev and prod builds with zero setup.
 

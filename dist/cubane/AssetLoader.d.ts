@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { BlockModel, BlockStateDefinition } from "./types";
 import { ResourcePackManager } from "./ResourcePackManager";
+import type { FluidTextures } from "../meshing/WaterMesher";
 export declare class AssetLoader {
     private resourcePacks;
     private resourcePackOrder;
@@ -13,8 +14,12 @@ export declare class AssetLoader {
     private modelCache;
     private textureCache;
     private materialCache;
+    private textureOpacityCache;
     private resourceGeneration;
+    private disposed;
+    private atlasBuildLoad;
     private fluidFramesLoad;
+    private readonly noFluidTextures;
     private textureLoader;
     private textureAtlas;
     private textureUVMap;
@@ -109,6 +114,9 @@ export declare class AssetLoader {
         semiTransparentPixelCount: number;
     };
     getSharedAtlasTexture(): THREE.Texture | null;
+    getResourceGeneration(): number;
+    /** Check the original tile, not the shared atlas (which also contains glass and padding). */
+    private textureAlpha;
     getMaterial(texturePath: string, options?: {
         transparent?: boolean;
         lightEmission?: number;
@@ -135,9 +143,12 @@ export declare class AssetLoader {
     private configureAtlasMips;
     private invalidateFluidFrames;
     private releaseFluidFrames;
+    /** The current pack generation's fluid frames; never shared across AssetLoaders. */
+    getFluidTextures(): FluidTextures;
     /** Decode once per pack generation, sharing concurrent callers even on atlas cache hits. */
     private loadFluidFrames;
     buildTextureAtlas(): Promise<THREE.Texture>;
+    private buildTextureAtlasGeneration;
     /**
      * Cache management methods
      */

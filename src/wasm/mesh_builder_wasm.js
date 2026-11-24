@@ -48,11 +48,9 @@ export class MeshBuilder {
      * @returns {any}
      */
     build_chunk_greedy(blocks, origin_x, origin_y, origin_z, apron_blocks) {
-        const ret = wasm.meshbuilder_build_chunk_greedy(this.__wbg_ptr, blocks, origin_x, origin_y, origin_z, apron_blocks);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        return takeFromExternrefTable0(ret[0]);
+        // Compatibility with the checked-in older binary: its greedy method
+        // replaces arbitrary model geometry with cubes and corrupts atlas UVs.
+        return this.build_chunk(blocks, origin_x, origin_y, origin_z, apron_blocks);
     }
     /**
      * Clear accumulators without returning data

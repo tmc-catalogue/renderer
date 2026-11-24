@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { AssetLoader } from "./AssetLoader";
 import { TextureAnimationMetadata } from "./types";
+import { analyzeRGBA } from "./TextureAlpha";
 /**
  * Animation metadata structure that matches Minecraft's mcmeta format
  */
@@ -8,18 +9,95 @@ import { TextureAnimationMetadata } from "./types";
 /**
  * Extended class to handle animated textures
  */
+interface InterpolatedFrames {
+	texture: THREE.DataTexture;
+	pixels: Uint8ClampedArray;
+	width: number;
+	height: number;
+	columns: number;
+	lastFrame: number;
+	lastNext: number;
+	lastMix: number;
+}
+
+/** Blend the two frames' RGB only; Minecraft preserves alpha from the current frame. */
+function sampleInterpolated(
+	frames: InterpolatedFrames,
+	frame: number,
+	next: number,
+	mix: number
+): boolean {
+	if (frame === frames.lastFrame && next === frames.lastNext && mix === frames.lastMix)
+		return false;
+	frames.lastFrame = frame;
+	frames.lastNext = next;
+	frames.lastMix = mix;
+	const { width, height, columns, pixels, texture } = frames;
+	const data = texture.image.data as Uint8Array;
+	const sourceWidth = width * columns;
+	const x0 = (frame % columns) * width,
+		x1 = (next % columns) * width;
+	const y0 = Math.floor(frame / columns) * height,
+		y1 = Math.floor(next / columns) * height;
+	for (let y = 0; y < height; y++) {
+		// DataTexture pixels start at the bottom, while decoded PNG pixels start at the top.
+		let cur = ((y0 + height - 1 - y) * sourceWidth + x0) * 4;
+		let following = ((y1 + height - 1 - y) * sourceWidth + x1) * 4;
+		let out = y * width * 4;
+		for (let x = 0; x < width; x++, cur += 4, following += 4, out += 4) {
+			for (let c = 0; c < 3; c++)
+				data[out + c] = Math.round(
+					pixels[cur + c] + (pixels[following + c] - pixels[cur + c]) * mix
+				);
+			data[out + 3] = pixels[cur + 3];
+		}
+	}
+	texture.needsUpdate = true;
+	return true;
+}
+
+function createInterpolatedFrames(
+	image: HTMLImageElement,
+	width: number,
+	height: number,
+	columns: number
+): InterpolatedFrames | undefined {
+	try {
+		const canvas = document.createElement("canvas");
+		canvas.width = image.width;
+		canvas.height = image.height;
+		const context = canvas.getContext("2d", { willReadFrequently: true });
+		if (!context) return;
+		context.drawImage(image, 0, 0);
+		const pixels = context.getImageData(0, 0, image.width, image.height).data;
+		const texture = new THREE.DataTexture(new Uint8Array(width * height * 4), width, height);
+		const alpha = analyzeRGBA(pixels);
+		texture.userData.sourceAlpha = alpha.alpha;
+		texture.userData.sourceHasOpaquePixels = alpha.hasOpaquePixels;
+		return { texture, pixels, width, height, columns, lastFrame: -1, lastNext: -1, lastMix: -1 };
+	} catch {
+		// A blocked canvas read is unusual for a local ZIP image; retain the native
+		// stepped timeline instead of losing the texture entirely.
+		return undefined;
+	}
+}
+
 export class AnimatedTextureManager {
 	private animatedTextures: Map<
 		string,
 		{
 			texture: THREE.Texture;
-			metadata: TextureAnimationMetadata;
+			indices: number[];
+			ends: number[];
+			duration: number;
+			columns: number;
+			rows: number;
 			currentFrame: number;
-			frameCount: number;
-			frameTime: number;
-			lastFrameTime: number;
+			startedAt: number;
+			interpolated?: InterpolatedFrames;
 		}
 	> = new Map();
+	private pending = new Map<string, Promise<THREE.Texture | null>>();
 	private generation = 0;
 	private pendingImages = new Set<() => void>();
 
@@ -35,6 +113,7 @@ export class AnimatedTextureManager {
 		this.generation++;
 		const textures = [...this.animatedTextures.values()].map(({ texture }) => texture);
 		this.animatedTextures.clear();
+		this.pending.clear();
 		for (const cancel of this.pendingImages) cancel();
 		return textures;
 	}
@@ -46,7 +125,17 @@ export class AnimatedTextureManager {
 		// Check if a .mcmeta file exists for this texture
 		const metadataPath = `${texturePath}.png.mcmeta`;
 		const metadata = await this.assetLoader.getResourceString(metadataPath);
-		return !!metadata;
+		if (!metadata) return false;
+		try {
+			const parsed = JSON.parse(metadata);
+			return (
+				!!parsed.animation &&
+				typeof parsed.animation === "object" &&
+				!Array.isArray(parsed.animation)
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -63,7 +152,12 @@ export class AnimatedTextureManager {
 		}
 
 		try {
-			return JSON.parse(metadataString) as TextureAnimationMetadata;
+			const metadata = JSON.parse(metadataString) as TextureAnimationMetadata;
+			return metadata.animation &&
+				typeof metadata.animation === "object" &&
+				!Array.isArray(metadata.animation)
+				? metadata
+				: null;
 		} catch (error) {
 			console.error(`Failed to parse animation metadata for ${texturePath}:`, error);
 			return null;
@@ -74,7 +168,6 @@ export class AnimatedTextureManager {
 	 * Create an animated texture
 	 */
 	public async createAnimatedTexture(texturePath: string): Promise<THREE.Texture | null> {
-		const generation = this.generation;
 		// Reuse an already-registered animated texture. Without this, a block whose
 		// faces share one texture (e.g. kelp's 4 cross faces) creates a new texture
 		// per face, but only the last one is tracked in `animatedTextures` and gets
@@ -84,7 +177,21 @@ export class AnimatedTextureManager {
 		if (existing) {
 			return existing.texture;
 		}
+		const pending = this.pending.get(texturePath);
+		if (pending) return pending;
+		const load = this.loadTexture(texturePath, this.generation);
+		this.pending.set(texturePath, load);
+		try {
+			return await load;
+		} finally {
+			if (this.pending.get(texturePath) === load) this.pending.delete(texturePath);
+		}
+	}
 
+	private async loadTexture(
+		texturePath: string,
+		generation: number
+	): Promise<THREE.Texture | null> {
 		// Load the metadata
 		const metadata = await this.loadAnimationMetadata(texturePath).catch((error) => {
 			if (generation !== this.generation) return null;
@@ -128,42 +235,90 @@ export class AnimatedTextureManager {
 					return;
 				}
 
-				// Calculate frame count based on image dimensions
-				// Typically, animated textures in Minecraft have frames stacked vertically
-				const frameCount = Math.floor(image.height / image.width);
+				// Minecraft also accepts horizontal sheets and explicit rectangular frames.
+				const animation = metadata.animation ?? {};
+				const width =
+					animation.width ?? (animation.height ? image.width : Math.min(image.width, image.height));
+				const height =
+					animation.height ??
+					(animation.width ? image.height : Math.min(image.width, image.height));
+				if (
+					!Number.isInteger(width) ||
+					!Number.isInteger(height) ||
+					width <= 0 ||
+					height <= 0 ||
+					image.width % width ||
+					image.height % height
+				) {
+					finish(null);
+					return;
+				}
+				const columns = image.width / width,
+					rows = image.height / height;
+				const frameCount = columns * rows;
+				const frameTime = animation.frametime ?? 1;
+				const defaultTime = Number.isSafeInteger(frameTime) && frameTime > 0 ? frameTime : 1;
+				const indices: number[] = [],
+					ends: number[] = [];
+				let duration = 0;
+				const frames = Array.isArray(animation.frames) ? animation.frames : undefined;
+				const length = frames?.length ?? frameCount;
+				for (let i = 0; i < length; i++) {
+					const frame = frames ? frames[i] : i;
+					if (typeof frame !== "number" && (typeof frame !== "object" || frame === null)) continue;
+					const index = typeof frame === "number" ? frame : frame.index;
+					const time = typeof frame === "number" ? defaultTime : (frame.time ?? defaultTime);
+					if (
+						!Number.isInteger(index) ||
+						index < 0 ||
+						index >= frameCount ||
+						!Number.isSafeInteger(time) ||
+						time <= 0 ||
+						!Number.isSafeInteger(duration + time)
+					)
+						continue;
+					indices.push(index);
+					ends.push((duration += time));
+				}
+				if (!indices.length) {
+					indices.push(0);
+					ends.push((duration = 1));
+				}
 
 				// Create texture
-				const texture = new THREE.Texture(image);
+				const interpolated =
+					animation.interpolate && indices.length > 1
+						? createInterpolatedFrames(image, width, height, columns)
+						: undefined;
+				const texture = interpolated?.texture ?? new THREE.Texture(image);
 				texture.minFilter = THREE.NearestFilter;
 				texture.magFilter = THREE.NearestFilter;
 				texture.wrapS = THREE.RepeatWrapping;
 				texture.wrapT = THREE.RepeatWrapping;
 
-				// Ensure animation property exists (some mcmeta files may have different structure)
-				if (!metadata.animation) {
-					metadata.animation = {};
-				}
-
-				// Set up animation parameters
-				const frameTime = metadata.animation.frametime || 1;
-				// Ensure frames are set for later use in the update method
-				if (!metadata.animation.frames) {
-					metadata.animation.frames = [...Array(frameCount).keys()]; // Default to sequential frames
-				}
-
 				// Configure texture repeat and offset for animation
-				texture.repeat.set(1, 1 / frameCount);
-				texture.offset.set(0, 0);
-				texture.needsUpdate = true;
+				const first = indices[0];
+				if (interpolated) sampleInterpolated(interpolated, first, first, 0);
+				else {
+					texture.repeat.set(1 / columns, 1 / rows);
+					texture.offset.set(
+						(first % columns) / columns,
+						1 - (Math.floor(first / columns) + 1) / rows
+					);
+					texture.needsUpdate = true;
+				}
 
 				// Store in animated textures map
 				this.animatedTextures.set(texturePath, {
 					texture,
-					metadata,
-					currentFrame: 0,
-					frameCount,
-					frameTime,
-					lastFrameTime: Date.now(),
+					indices,
+					ends,
+					duration,
+					columns,
+					rows,
+					currentFrame: first,
+					startedAt: Date.now(),
+					interpolated,
 				});
 
 				finish(texture);
@@ -186,25 +341,30 @@ export class AnimatedTextureManager {
 		let advanced = false;
 
 		this.animatedTextures.forEach((data, _texturePath) => {
-			const { texture, metadata, frameCount, frameTime } = data;
-
-			// Calculate elapsed time since last frame update (in game ticks)
-			// Minecraft runs at 20 ticks per second, so 50ms per tick
-			const elapsedTicks = Math.floor((now - data.lastFrameTime) / 50);
-
-			if (elapsedTicks >= frameTime) {
-				// Time to advance to next frame
-				data.lastFrameTime = now;
-
-				// Get the frame index to display
-				const frames = metadata.animation.frames || [...Array(frameCount).keys()];
-				data.currentFrame = (data.currentFrame + 1) % frames.length;
-				const frameIndex = frames[data.currentFrame];
-
-				// Update texture offset to show the correct frame
-				// Minecraft textures stack frames vertically from top to bottom
-				texture.offset.set(0, 1 - (frameIndex + 1) / frameCount);
-				texture.needsUpdate = true;
+			const { texture, indices, ends, duration, columns, rows } = data;
+			// Absolute timeline avoids drift, even after a background tab stalls.
+			const ticks = Math.max(0, Math.floor((now - data.startedAt) / 50)) % duration;
+			let low = 0,
+				high = ends.length - 1;
+			while (low < high) {
+				const mid = (low + high) >>> 1;
+				if (ticks < ends[mid]) high = mid;
+				else low = mid + 1;
+			}
+			const frame = indices[low];
+			if (data.interpolated) {
+				const start = low ? ends[low - 1] : 0;
+				const next = indices[(low + 1) % indices.length];
+				const mix = next === frame ? 0 : (ticks - start) / (ends[low] - start);
+				advanced =
+					sampleInterpolated(data.interpolated, frame, mix ? next : frame, mix) || advanced;
+			} else if (frame !== data.currentFrame) {
+				data.currentFrame = frame;
+				texture.offset.set(
+					(frame % columns) / columns,
+					1 - (Math.floor(frame / columns) + 1) / rows
+				);
+				// Only the texture transform changes; no GPU image re-upload is needed.
 				advanced = true;
 			}
 		});

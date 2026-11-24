@@ -14,16 +14,18 @@ export class ModelResolver {
 	public async resolveBlockModel(block: Block): Promise<ModelData[]> {
 		// Special handling for liquids - use the minimal model files that exist
 		if (
-			block.name === "water" ||
-			block.name === "flowing_water" ||
-			block.name === "lava" ||
-			block.name === "flowing_lava"
+			block.namespace === "minecraft" &&
+			(block.name === "water" ||
+				block.name === "flowing_water" ||
+				block.name === "lava" ||
+				block.name === "flowing_lava")
 		) {
 			return this.createLiquidModelData(block);
 		}
 
 		// Regular block state handling
-		const blockName = block.name.replace("minecraft:", "");
+		const blockName =
+			block.namespace === "minecraft" ? block.name : `${block.namespace}:${block.name}`;
 		const blockStateDefinition = await this.assetLoader.getBlockState(blockName);
 
 		// If no definition, return empty array

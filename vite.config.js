@@ -4,6 +4,22 @@ import topLevelAwait from 'vite-plugin-top-level-await';
 import path from 'path';
 import fs from 'fs';
 
+const publicAssetsDir = path.resolve(__dirname, 'test/public');
+const benchmarkDirs = new Set(['gpu-mesher', 'schematics']);
+
+const libraryPublicAssets = () => ({
+  name: 'library-public-assets',
+  apply: 'build',
+  writeBundle({ dir, format }) {
+    // The ES and UMD bundles share one output directory.
+    if (format !== 'es') return;
+    fs.cpSync(publicAssetsDir, dir, {
+      recursive: true,
+      filter: (source) => !benchmarkDirs.has(path.relative(publicAssetsDir, source)),
+    });
+  },
+});
+
 // Inlines .wasm files as base64 data URLs so the library bundle is self-contained.
 const wasmInlinePlugin = () => ({
   name: 'wasm-inline',
@@ -33,9 +49,10 @@ export default defineConfig({
     },
   },
   root: './test/pages',
-  publicDir: '../public',
+  publicDir: publicAssetsDir,
   build: {
     outDir: '../../dist',
+    copyPublicDir: false,
     lib: {
       entry: path.resolve(__dirname, 'src/index.ts'),
       name: 'SchematicRenderer',
@@ -54,6 +71,7 @@ export default defineConfig({
     },
   },
   plugins: [
+    libraryPublicAssets(),
     wasmInlinePlugin(),
     // topLevelAwait(), // TEMP: plugin crashes lib build (missing field `type`) — testing without
     wasm(),

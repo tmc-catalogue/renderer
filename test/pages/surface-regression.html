@@ -8,17 +8,20 @@ import { SchematicRenderer } from "../../src/SchematicRenderer";
 import { demoResourcePacks } from "./scripts/demo-packs";
 const report = document.getElementById("report"), lines = [];
 const mode = new URLSearchParams(location.search).get("mode") || "batched";
+const wasm = new URLSearchParams(location.search).get("wasm") !== "false";
 function check(value, label) { if (!value) throw new Error(label); lines.push("PASS " + label); report.textContent = `${mode}\n` + lines.join("\n"); }
 const renderer = new SchematicRenderer(document.getElementById("canvas"), {
  gallery: async () => (await fetch("/schematics/glass-portals.litematic")).arrayBuffer()
 }, demoResourcePacks, {
  meshBuildingMode: mode, enableAnimatedTextures: true, enableProgressBar: false,
+ wasmMeshBuilderOptions: { enabled: wasm },
  enableGizmos: false, showGrid: false, showAxes: false,
  callbacks: { onRendererInitialized: (r) => run(r).catch(e => { report.textContent += "\nFAIL " + e.stack; console.error(e); }) }
 });
 async function run(r) {
  const s = r.schematicManager.schematics.values().next().value;
  await s.getMeshes();
+ if (mode.startsWith("gpu")) check(s.gpuBuilt, "GPU meshing executed without CPU fallback");
  const surfaceMeshes = () => s.group.children.filter(m => m.userData.surfaceMesh);
  const counts = () => surfaceMeshes().reduce((n,m) => n+(m.geometry.index?.count || m.geometry.getAttribute("position").count),0);
  const before = counts();
@@ -45,10 +48,11 @@ async function run(r) {
  const old = s.group.position.clone(); s.group.position.set(10000,10000,10000);
  check(!s.hasSurfacesInView(frustum), "Offscreen End portal does not animate");
  s.group.position.copy(old); s.group.updateMatrixWorld(true);
+ const glassMaterials = new Map(surfaceMeshes().filter(m=>m.name === "connected-glass-and-portals").map(m=>[m.material, {transparent:m.material.transparent, depthWrite:m.material.depthWrite, alphaTest:m.material.alphaTest}]));
  s.opacity = 0; s.updateMeshMaterials("opacity"); r.renderManager.render();
  check(material.uniforms.uOpacity.value === 0, "End portal follows schematic opacity");
  s.opacity = 1; s.updateMeshMaterials("opacity"); r.renderManager.render();
- check(surfaceMeshes().filter(m=>m.name === "connected-glass-and-portals").every(m=>m.material.transparent), "Glass stays transparent after fading");
+ check([...glassMaterials].every(([m,v]) => m.transparent === v.transparent && m.depthWrite === v.depthWrite && m.alphaTest === v.alphaTest), "Glass restores its intrinsic cutout/blend state after fading");
  await s.setBlock([1,2,2], "minecraft:stone");
  await s.setBlock([1,2,2], "minecraft:white_stained_glass");
  check(counts() === before, "Opaque transition rebuild restores all surfaces");

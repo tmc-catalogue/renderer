@@ -13,9 +13,13 @@ export declare class WorldMeshBuilder {
     private useInstancedRendering;
     private static nextMeshContextId;
     private readonly meshContextId;
+    private nextWorkerRequest;
     private workers;
     private freeWorkers;
     private workerQueue;
+    private readonly leasedWorkers;
+    private readonly workerWaiters;
+    private disposed;
     private pendingRequests;
     private maxWorkers;
     private chunkSize;
@@ -66,10 +70,10 @@ export declare class WorldMeshBuilder {
     };
     static resetStats(): void;
     private batchPendingChunks;
-    private batchFinishResolve;
-    private _batchFinishReject;
+    private batchFinishRequests;
     private handleWorkerMessage;
     private returnWorker;
+    private newWorkerRequestId;
     setChunkSize(newChunkSize: number): void;
     getChunkSize(): number;
     setQuantization(enabled: boolean): void;
@@ -80,8 +84,10 @@ export declare class WorldMeshBuilder {
      * Call this when textures/materials change (e.g., resource pack change).
      */
     invalidateCache(): void;
+    private releasePaletteBlocks;
     precomputePaletteGeometries(palette: any[], fluidSurface?: boolean): Promise<void>;
     private getFreeWorker;
+    private buildChunkWithWorker;
     /**
      * Process all chunks in batch mode - returns merged meshes
      * instead of one mesh per chunk. This reduces main thread work significantly.
@@ -146,8 +152,7 @@ export declare class WorldMeshBuilder {
         enabled?: boolean;
     }, preFilteredEntities?: any[]): Promise<THREE.Object3D[]>;
     private createBlockStringFromPaletteEntry;
-    private static readonly IMPLICIT_WATERLOGGED;
-    private getBlockCategory;
+    private getMaterialCategory;
     private configureMeshForCategory;
     extractAllMeshData(rootCubaneObject: THREE.Object3D): ProcessedBlockGeometry[];
     private createFallbackObject3D;

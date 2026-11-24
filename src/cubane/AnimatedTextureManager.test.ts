@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AnimatedTextureManager } from "./AnimatedTextureManager";
 import type { AssetLoader } from "./AssetLoader";
+import * as THREE from "three";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -59,11 +60,90 @@ describe("animated texture cache invalidation", () => {
 		vi.setSystemTime(Date.now() + 100);
 		expect(manager.update()).toBe(true);
 		expect(second.offset.y).toBe(0.5);
-		expect(first.offset.y).toBe(0);
+		expect(first.offset.y).toBe(0.5); // Minecraft frame 0 is at the top of the strip.
 		expect(manager.clear()).toEqual([second]);
 		expect(manager.clear()).toEqual([]);
 		first.dispose();
 		second.dispose();
+	});
+
+	it("shares pending sprite loads and honors explicit frame sizes, order, and duration", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { manager, assets, images } = setup();
+		assets.getResourceString.mockResolvedValue(
+			JSON.stringify({
+				animation: { width: 8, height: 4, frametime: 2, frames: [{ index: 3, time: 5 }, 0, 2] },
+			})
+		);
+		const a = manager.createAnimatedTexture("block/magma");
+		const b = manager.createAnimatedTexture("block/magma");
+		await vi.waitFor(() => expect(images).toHaveLength(1));
+		images[0].width = 16;
+		images[0].height = 8;
+		images[0].onload!();
+		const texture = (await a)!;
+		expect(await b).toBe(texture);
+		expect(texture.repeat.toArray()).toEqual([0.5, 0.5]);
+		expect(texture.offset.toArray()).toEqual([0.5, 0]);
+		const version = texture.version;
+		vi.setSystemTime(Date.now() + 250);
+		expect(manager.update()).toBe(true);
+		expect(texture.offset.toArray()).toEqual([0, 0.5]);
+		vi.setSystemTime(Date.now() + 100);
+		expect(manager.update()).toBe(true);
+		expect(texture.offset.toArray()).toEqual([0, 0]);
+		vi.setSystemTime(Date.now() + 550); // Skip a full cycle while hidden.
+		expect(manager.update()).toBe(true);
+		expect(texture.offset.toArray()).toEqual([0.5, 0]);
+		expect(texture.version).toBe(version);
+	});
+
+	it.each([
+		{ frames: {}, order: [0.5, 0] },
+		{ frames: [null, { index: 1 }, false, 0], order: [0, 0.5] },
+	])("loads a texture with malformed frame metadata ($frames)", async ({ frames, order }) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { manager, assets, images, revoke } = setup();
+		assets.getResourceString.mockResolvedValue(JSON.stringify({ animation: { frames } }));
+		const pending = manager.createAnimatedTexture("block/kelp");
+		await vi.waitFor(() => expect(images).toHaveLength(1));
+		images[0].onload!();
+		const texture = (await pending)!;
+		expect(texture.offset.y).toBe(order[0]);
+		vi.setSystemTime(Date.now() + 50);
+		expect(manager.update()).toBe(true);
+		expect(texture.offset.y).toBe(order[1]);
+		expect(revoke).toHaveBeenCalledOnce();
+		texture.dispose();
+	});
+
+	it("interpolates RGB between requested frames without changing current alpha", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { manager, assets, images } = setup();
+		assets.getResourceString.mockResolvedValue('{"animation":{"frametime":2,"interpolate":true}}');
+		vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+			drawImage: vi.fn(),
+			getImageData: () => ({ data: new Uint8ClampedArray([255, 0, 0, 255, 0, 0, 255, 128]) }),
+		} as any);
+		const pending = manager.createAnimatedTexture("block/prismarine");
+		await vi.waitFor(() => expect(images).toHaveLength(1));
+		images[0].width = 1;
+		images[0].height = 2;
+		images[0].onload!();
+		const texture = (await pending)! as THREE.DataTexture;
+		expect(texture.isDataTexture).toBe(true);
+		expect([...texture.image.data!]).toEqual([255, 0, 0, 255]);
+		expect(texture.userData.sourceAlpha).toBe("blend");
+		vi.setSystemTime(Date.now() + 50);
+		expect(manager.update()).toBe(true);
+		expect([...texture.image.data!]).toEqual([128, 0, 128, 255]);
+		expect(manager.update()).toBe(false);
+		vi.setSystemTime(Date.now() + 50);
+		expect(manager.update()).toBe(true);
+		expect([...texture.image.data!]).toEqual([0, 0, 255, 128]);
 	});
 
 	it("cancels pending image decodes and ignores their late callbacks after clear", async () => {

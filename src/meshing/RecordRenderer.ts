@@ -19,11 +19,108 @@ export interface RecordTables {
 
 export interface RecordStream {
 	// one concatenated record array per transparency category: pairs (cell, row)
-	perCategory: { category: string; records: Uint32Array; tris: number }[];
+	perCategory: RecordMaterialRun[];
 	tables: RecordTables;
 	sx: number;
 	sy: number;
 	sz: number;
+}
+
+/** A material-contiguous record run. The actual material, not the block's summary
+ * category, determines the render pass. Multiple states sharing the atlas/material
+ * remain batched together. */
+export interface RecordMaterialRun {
+	category: string;
+	records: Uint32Array;
+	tris: number;
+	material?: THREE.Material;
+	y0?: number;
+	h?: number;
+}
+
+/** Expand compute-selected triangles into conventional Three geometry on adapters
+ * that cannot bind all of the direct vertex-output storage buffers at once. */
+export function materializeRecordMeshes(stream: RecordStream): THREE.Mesh[] {
+	const { tables, sx, sz } = stream;
+	const meshes: THREE.Mesh[] = [];
+	const chunkTriangles = 1_000_000;
+	for (const run of stream.perCategory) {
+		if (!run.material) throw new Error(`Missing record material in ${run.category}`);
+		for (let start = 0; start < run.tris; start += chunkTriangles) {
+			const count = Math.min(chunkTriangles, run.tris - start);
+			const positions = new Float32Array(count * 9);
+			const normals = new Float32Array(count * 9);
+			const uvs = new Float32Array(count * 6);
+			for (let i = 0; i < count; i++) {
+				const recordIndex = (start + i) * 2;
+				const cell = run.records[recordIndex];
+				const row = run.records[recordIndex + 1];
+				const x = cell % sx;
+				const y = Math.floor(cell / (sx * sz));
+				const z = Math.floor(cell / sx) % sz;
+				for (let k = 0; k < 3; k++) {
+					const corner = tables.rowCorners[row * 4 + k] * 4;
+					const xyz = (i * 3 + k) * 3;
+					const uv = (i * 3 + k) * 2;
+					positions[xyz] = x + tables.tplPos[corner];
+					positions[xyz + 1] = y + tables.tplPos[corner + 1];
+					positions[xyz + 2] = z + tables.tplPos[corner + 2];
+					normals[xyz] = tables.tplNrm[corner];
+					normals[xyz + 1] = tables.tplNrm[corner + 1];
+					normals[xyz + 2] = tables.tplNrm[corner + 2];
+					uvs[uv] = tables.tplUv[corner];
+					uvs[uv + 1] = tables.tplUv[corner + 1];
+				}
+			}
+			const geometry = new THREE.BufferGeometry();
+			geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+			geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+			geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+			geometry.computeBoundingSphere();
+			const mesh = new THREE.Mesh(geometry, run.material);
+			mesh.userData.category = run.category;
+			mesh.userData.gpuBuilt = true;
+			meshes.push(mesh);
+		}
+	}
+	return meshes;
+}
+
+export function recordMaterialCategory(material: THREE.Material, fluid?: string): string {
+	if (fluid === "water") return "water";
+	if (material.transparent || material.opacity < 1) return "transparent";
+	return material.alphaTest > 0 ? "cutout" : "solid";
+}
+
+/** The compute pass writes material-contiguous records. Reuse their backing
+ * buffer as zero-copy views so the normal shared-atlas/material fast path does
+ * not add geometry copies or per-triangle classification work. */
+export function splitRecordMaterialRuns(
+	records: Uint32Array,
+	counts: readonly number[],
+	materials: readonly THREE.Material[],
+	category: string,
+	y0?: number,
+	h?: number
+): RecordMaterialRun[] {
+	const runs: RecordMaterialRun[] = [];
+	let offset = 0;
+	for (let i = 0; i < counts.length; i++) {
+		const tris = counts[i];
+		if (tris === 0) continue;
+		const material = materials[i];
+		if (!material) throw new Error(`Missing record material ${i} in ${category}`);
+		runs.push({
+			category: recordMaterialCategory(material, material.userData.isWater ? "water" : undefined),
+			material,
+			records: records.subarray(offset * 2, (offset + tris) * 2),
+			tris,
+			y0,
+			h,
+		});
+		offset += tris;
+	}
+	return runs;
 }
 
 const RW = 8192; // records texture width (chunk rows ≤ 1024 → ≤64MB per texture, D3D-cap-safe)
@@ -114,11 +211,12 @@ export function sectionize(
 function chunkWithSections(
 	rec: Uint32Array,
 	sections: SectionRange[],
-	_chunk: number
+	chunkSize: number
 ): { rec: Uint32Array; items: number; sections: SectionRange[] }[] {
 	const out: { rec: Uint32Array; items: number; sections: SectionRange[] }[] = [];
-	for (let base = 0; base < sectionsTotal(sections); base += CHUNK_TRIS) {
-		const items = Math.min(CHUNK_TRIS, sectionsTotal(sections) - base);
+	const total = sectionsTotal(sections);
+	for (let base = 0; base < total; base += chunkSize) {
+		const items = Math.min(chunkSize, total - base);
 		const clipped: SectionRange[] = [];
 		for (const s of sections) {
 			const a = Math.max(s.base, base),
@@ -129,6 +227,11 @@ function chunkWithSections(
 	}
 	if (out.length === 0) out.push({ rec: new Uint32Array(0), items: 0, sections: [] });
 	return out;
+}
+
+/** Each independently culled section starts on a page boundary. */
+export function sectionPageCount(sections: readonly SectionRange[]): number {
+	return sections.reduce((sum, section) => sum + Math.ceil(section.count / PAGE), 0);
 }
 function sectionsTotal(sections: SectionRange[]): number {
 	let n = 0;
@@ -142,8 +245,7 @@ function attachSectionCulling(
 	sections: SectionRange[],
 	pageTable: THREE.DataTexture,
 	pageData: Uint32Array,
-	perItem: number, // 3 (tri) or 6 (quad — drawRange is in index units)
-	backToFront: boolean
+	perItem: number // 3 (tri) or 6 (quad — drawRange is in index units)
 ): void {
 	const frustum = new THREE.Frustum();
 	const vp = new THREE.Matrix4();
@@ -156,43 +258,67 @@ function attachSectionCulling(
 			)
 	);
 	const order: number[] = [];
+	const previousOrder: number[] = [];
+	const previousWorld = new THREE.Matrix4();
+	const previousProjection = new THREE.Matrix4();
+	let initialized = false;
+	let previousTransparent = false;
+	const center = new THREE.Vector3();
+	const depthForSection = new Float64Array(sections.length);
+	const cameraPosition = new THREE.Vector3();
 	mesh.onBeforeRender = (_renderer, _scene, camera) => {
-		// strip animation clock (liquid still/flow)
 		const mat = mesh.material as THREE.ShaderMaterial;
-		if (mat.uniforms?.uTime) mat.uniforms.uTime.value = performance.now() / 1000;
-		// lazy-bind the liquid frame array (registered by AssetLoader after atlas build)
-		if (
-			mat.uniforms?.uWaterFramesOn &&
-			mat.uniforms.uWaterFramesOn.value === 0 &&
-			liquidFrameTextures.water
-		) {
-			mat.uniforms.uWaterFrames.value = liquidFrameTextures.water;
-			mat.uniforms.uWaterFramesOn.value = 1;
+		// Animated maps own their texture transform (updated by the asset loader's
+		// animation clock). This also handles ordinary resource-pack map transforms.
+		mat.uniforms.uOpacity.value = mat.opacity;
+		const map = mat.uniforms.uAtlas.value as THREE.Texture | null;
+		if (map) {
+			if (map.matrixAutoUpdate) map.updateMatrix();
+			mat.uniforms.uMapMatrix.value.copy(map.matrix);
 		}
 		vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-		frustum.setFromProjectionMatrix(vp);
 		// update ancestors too: the schematic group REPOSITIONS per build (each load
 		// centers a different-sized build), and matrixAutoUpdate=false never refreshes
 		// matrixWorld from a moved parent — stale world boxes culled visible sections
 		// ("blocks vanish from afar, appear elsewhere as the view changes")
 		mesh.updateWorldMatrix(true, false);
-		for (let i = 0; i < gridBoxes.length; i++)
-			worldBoxes[i].copy(gridBoxes[i]).applyMatrix4(mesh.matrixWorld);
+		const worldChanged = !initialized || !previousWorld.equals(mesh.matrixWorld);
+		const projectionChanged = !initialized || !previousProjection.equals(vp);
+		if (!worldChanged && !projectionChanged && previousTransparent === mat.transparent) return;
+		if (worldChanged) {
+			previousWorld.copy(mesh.matrixWorld);
+			for (let i = 0; i < gridBoxes.length; i++)
+				worldBoxes[i].copy(gridBoxes[i]).applyMatrix4(mesh.matrixWorld);
+		}
+		previousProjection.copy(vp);
+		previousTransparent = mat.transparent;
+		frustum.setFromProjectionMatrix(vp);
 		order.length = 0;
-		const cp = camera.getWorldPosition(new THREE.Vector3());
-		for (let i = 0; i < worldBoxes.length; i++)
-			if (frustum.intersectsBox(worldBoxes[i])) order.push(i);
-		order.sort((a, b) => {
-			const da = boxDistSq(worldBoxes[a], cp),
-				db = boxDistSq(worldBoxes[b], cp);
-			return backToFront ? db - da : da - db;
-		});
+		camera.getWorldPosition(cameraPosition);
+		for (let i = 0; i < worldBoxes.length; i++) {
+			if (!frustum.intersectsBox(worldBoxes[i])) continue;
+			order.push(i);
+			depthForSection[i] = mat.transparent
+				? worldBoxes[i].getCenter(center).applyMatrix4(camera.matrixWorldInverse).z
+				: boxDistSq(worldBoxes[i], cameraPosition);
+		}
+		// Translucent view-space z is negative in front of the camera: the more
+		// negative section is farther, whereas opaque sorting uses near-box distance.
+		order.sort((a, b) => depthForSection[a] - depthForSection[b]);
+		if (
+			initialized &&
+			order.length === previousOrder.length &&
+			order.every((s, i) => s === previousOrder[i])
+		)
+			return;
+		initialized = true;
+		previousOrder.length = 0;
+		for (const section of order) previousOrder.push(section);
 		// flatten visible sections into pages
 		let p = 0;
 		for (const si of order) {
 			const s = sections[si];
 			for (let o = 0; o < s.count; o += PAGE) {
-				if (p * 2 + 1 >= pageData.length) break;
 				pageData[p * 2] = s.base + o;
 				pageData[p * 2 + 1] = Math.min(PAGE, s.count - o);
 				p++;
@@ -204,15 +330,12 @@ function attachSectionCulling(
 		}
 		pageTable.needsUpdate = true;
 		(mesh as any).userData.pagesDrawn = p;
-		// the quad path's drawRange is in INDEX units: page padding can push the count
-		// past the static index buffer's end (quads not divisible by PAGE) — GL then
-		// rejects the entire draw and NOTHING renders. Padded slots have no backing
-		// indices, so clamping to the buffer is lossless.
-		const cap = mesh.geometry.index ? mesh.geometry.index.count : Infinity;
-		mesh.geometry.setDrawRange(0, Math.min(p * PAGE * perItem, cap));
+		// Padded slots have index backing too; truncating to the actual face count
+		// would remove valid faces in later sections.
+		mesh.geometry.setDrawRange(0, p * PAGE * perItem);
 	};
 	// safety net for direct draws before the first onBeforeRender fires: all pages
-	mesh.userData.pagesDrawn = Math.ceil(sectionsTotal(sections) / PAGE);
+	mesh.userData.pagesDrawn = sectionPageCount(sections);
 }
 function boxDistSq(b: THREE.Box3, p: THREE.Vector3): number {
 	const dx = Math.max(b.min.x - p.x, 0, p.x - b.max.x);
@@ -237,19 +360,10 @@ uniform highp sampler2D uNrm;       // RGBA32F
 uniform highp sampler2D uUv;        // RGBA32F atlas-space uvs
 uniform vec3 uDims;                 // sx, sy, sz (vec3 — uvec3 uniform setters vary)
 uniform vec4 uPow2;                 // (xMask, zShiftZMask, yShift, enabled) — pow2 fast decode (gpt-6 #3)
+uniform mat3 uMapMatrix;
 out vec2 vUv;
 out float vShade;
-out float vWy;
 out float vCy;
-// strip animation (liquid still/flow): signed frames, frame step, frame-0 top V.
-// FLAT: these are per-face constants; interpolating them lets a quad straddle
-// two parameter sets and feeds a varying into fragment control flow.
-flat out float vAnimF;
-flat out float vStep;
-flat out float vTop;
-// fable water: full world position (smooth) + face normal (flat) for the frame-array path
-out vec3 vWp;
-flat out vec3 vNw;
 uniform vec2 uLayerClip; // (enabled, topY) — slice view: discard fragments above grid Y
 void main() {
   uint vid = uint(gl_VertexID);
@@ -277,7 +391,7 @@ void main() {
   uint vi = k == 0u ? corners.x : (k == 1u ? corners.y : corners.z);
   ivec2 ct = ivec2(int(vi) & ${TW - 1}, int(vi) / ${TW});
   vec3 pos = texelFetch(uPos, ct, 0).xyz;
-  vUv = texelFetch(uUv, ct, 0).xy;
+  vUv = (uMapMatrix * vec3(texelFetch(uUv, ct, 0).xy, 1.0)).xy;
   // Fixed WORLD-space face shading (vanilla-style: top 1.0, bottom 0.5, z 0.8, x 0.6).
   // The previous view-space light (normalMatrix * n dotted with a fixed dir) made the
   // bright/dark set reshuffle with every camera move — the "black/white checker that
@@ -287,15 +401,7 @@ void main() {
   vShade = (ay >= ax && ay >= az) ? (wn.y > 0.0 ? 1.0 : 0.5) : (az >= ax ? 0.8 : 0.6);
   // oracle-frozen arithmetic: same componentwise f32 add the compute mesher performs
   vec3 world = vec3(bc) + pos;
-  vWy = world.y;
   vCy = float(bc.y); // owning CELL y — layer slicing is cell-aligned, not a geometry cut
-  // animation channels ride in the free w components of the corner tables
-  vAnimF = texelFetch(uUv, ct, 0).w;
-  vStep = texelFetch(uPos, ct, 0).w;
-  vTop = texelFetch(uNrm, ct, 0).w;
-  // world position + normal for the water frame-array path (fable)
-  vWp = world;
-  vNw = wn;
   gl_Position = projectionMatrix * (modelViewMatrix * vec4(world, 1.0));
 }`;
 
@@ -310,123 +416,46 @@ const PULL_VERT_QUAD = PULL_VERT.replace("uint slot = vid / 3u;", "uint slot = v
 
 const PULL_FRAG_BASE = /* glsl */ `
 precision highp float;
-precision highp sampler2DArray;
 uniform sampler2D uAtlas;
-uniform sampler2DArray uWaterFrames; // fable: liquid frames as array LAYERS (hardware wrap, no atlas bleed)
-uniform float uWaterFramesOn;        // 1.0 when the array texture is loaded
+uniform float uHasMap;
+uniform float uAtlasMipCap;
+uniform sampler2D uEmissiveMap;
+uniform float uHasEmissiveMap;
+uniform vec3 uTint;
+uniform vec3 uEmissive;
+uniform float uOpacity;
+uniform float uBaseOpacity;
+uniform float uAlphaTest;
 uniform vec2 uLayerClip;
 uniform float uShadeMix;
-uniform float uTime;
 in vec2 vUv;
 in float vShade;
-in float vWy;
 in float vCy;
-// per-primitive constants: flat, so a quad never blends two faces' parameters
-flat in float vAnimF;
-flat in float vStep;
-flat in float vTop;
-in vec3 vWp;
-flat in vec3 vNw;
 layout(location = 0) out vec4 outColor;
 
-// ONE world-space flow for the whole water body (blocks per second).
-// Tops scroll by (x,z); x-normal sides scroll along z by WATER_FLOW.y; z-normal
-// sides scroll along x by WATER_FLOW.x; every side also falls by WATER_FALL.
-// Shared edges therefore move identically on both faces ("one continuous flow").
-const vec2  WATER_FLOW = vec2(0.045, 0.030);
-const float WATER_FALL = 0.090;
-const float WATER_FPS  = 5.0;
-const float WATER_TEXELS_PER_BLOCK = 16.0;
-// second octave at 1/4 scale breaks the 1-block tile period (same mean, same flow)
-const float WATER_OCT2_SCALE = 0.25;
-const float WATER_OCT2_MIX   = 0.35;
-
-// two-frame cross-fade at ONE explicit LOD (no implicit derivatives anywhere in
-// the water path -> defined regardless of the enclosing non-uniform branch)
-vec4 waterTap(vec2 uv, float k0, float k1, float fk, float lod) {
-  vec4 a = textureLod(uWaterFrames, vec3(uv, k0), lod);
-  vec4 b = textureLod(uWaterFrames, vec3(uv, k1), lod);
-  return mix(a, b, fk);
-}
-
 void main() {
-  // ---- ALL derivatives up front, in uniform control flow, before any discard ----
-  // atlas path
-  vec2 duv = vUv * 2048.0;
-  float dx2 = dot(dFdx(duv), dFdx(duv));
-  float dy2 = dot(dFdy(duv), dFdy(duv));
-  float lod = 0.5 * log2(max(dx2, dy2));
-
-  // water path: world-space uv for THIS face (normal is flat -> constant per primitive)
-  vec3 an = abs(vNw);
-  vec2 wuv;
-  vec2 scroll;
-  if (an.y > 0.5) {
-    wuv = vWp.xz;
-    scroll = WATER_FLOW;
-  } else if (an.x > 0.5) {
-    wuv = vWp.zy;
-    scroll = vec2(WATER_FLOW.y, WATER_FALL);
-  } else {
-    wuv = vWp.xy;
-    scroll = vec2(WATER_FLOW.x, WATER_FALL);
-  }
-  // scroll is spatially constant, so it does not change the derivatives
-  wuv += scroll * uTime;
-  vec2 wduv = wuv * WATER_TEXELS_PER_BLOCK;
-  float wdx2 = dot(dFdx(wduv), dFdx(wduv));
-  float wdy2 = dot(dFdy(wduv), dFdy(wduv));
-  // ISOTROPIC (max-axis) LOD: the footprint's long axis decides, so the result does
-  // not depend on footprint orientation -> no view-direction-dependent mip patchwork.
-  // Level 4 of a 16x16 layer is its 1x1 mean: distance converges to a uniform sheet.
-  float wlod = clamp(0.5 * log2(max(max(wdx2, wdy2), 1e-12)), 0.0, 4.0);
-  // 1/4-scale octave has 4x fewer texels per pixel -> two levels sharper
-  float wlod2 = clamp(wlod - 2.0, 0.0, 4.0);
-
-  // layer slice, CELL-aligned: partial geometry (fences are 1.5 tall, slabs 0.5)
-  // belongs wholly to its owning cell, so Minecraft layer view must cut on bc.y,
-  // not on world Y (a Y-plane halves fences/panes at layer boundaries)
-  if (uLayerClip.x > 0.5 && vCy > uLayerClip.y + 0.5) discard;
-
-  // Cap atlas mip selection at level 4 (a 16px tile is 1px there): levels 5+ average
-  // across atlas tiles — foreign colors and the transparent padding between tiles.
-  // ISOTROPIC textureLod, not textureGrad: anisotropic footprints at the LOD-4 cap
-  // stretch flat-on wall faces ACROSS neighbouring atlas tiles.
-  vec4 c;
-  if (vAnimF != 0.0 && uWaterFramesOn > 0.5) {
-    // fable WATER ARRAY PATH: frames are array LAYERS (16x16 each) with hardware
-    // RepeatWrapping; uvs are world coordinates (continuous across every block
-    // boundary by construction); nothing can sample outside the water texture.
-    float nFrames = float(textureSize(uWaterFrames, 0).z);
-    float ft = mod(uTime * WATER_FPS, nFrames);
-    float k0 = floor(ft);
-    float k1 = mod(k0 + 1.0, nFrames);
-    float fk = ft - k0;
-    vec4 c1 = waterTap(wuv, k0, k1, fk, wlod);
-    vec4 c2 = waterTap(wuv * WATER_OCT2_SCALE + vec2(0.37, 0.61), k0, k1, fk, wlod2);
-    c = mix(c1, c2, WATER_OCT2_MIX);
-  } else {
-    vec2 tuv = vUv;
-    if (vAnimF > 0.5) {
-      float k = floor(mod(uTime * 5.0, vAnimF));
-      float lv = clamp(vUv.y - (vTop - vStep), 0.03 * vStep, 0.97 * vStep);
-      tuv.y = (vTop - vStep) + lv - k * vStep;
-    } else if (vAnimF < -0.5) {
-      float frames = -vAnimF;
-      float k = floor(mod(uTime * 5.0, frames));
-      float q = clamp(fract(vWy * 0.5 + uTime * 0.25), 0.03, 0.97);
-      tuv.y = (vTop - k * vStep) - q * vStep;
-      float lu = clamp(fract(vUv.x / vStep), 0.03, 0.97);
-      float u0 = vUv.x - lu * vStep;
-      tuv.x = u0 + fract(lu + vWp.x + vWp.z + uTime * 0.08) * vStep;
+  // Sample the actual material map, including its live animation transform.
+  // Water and lava use a dedicated shared surface pass, never this sampler.
+  vec4 c = vec4(1.0);
+  if (uHasMap > 0.5) {
+    if (uAtlasMipCap >= 0.0) {
+      // Sample isolated atlas mip levels; levels past the tile size blend unrelated tiles.
+      vec2 duv = vUv * vec2(textureSize(uAtlas, 0));
+      float dx2 = dot(dFdx(duv), dFdx(duv));
+      float dy2 = dot(dFdy(duv), dFdy(duv));
+      float lod = 0.5 * log2(max(max(dx2, dy2), 1e-12));
+      c = textureLod(uAtlas, vUv, min(lod, uAtlasMipCap));
+    } else {
+      c = texture(uAtlas, vUv);
     }
-    c = textureLod(uAtlas, tuv, min(lod, 4.0));
   }
+  vec3 emission = uEmissive;
+  if (uHasEmissiveMap > 1.5) emission *= c.rgb;
+  else if (uHasEmissiveMap > 0.5) emission *= texture(uEmissiveMap, vUv).rgb;
+  // Clip by owning block cell, not a geometry's actual elevation.
+  if (uLayerClip.x > 0.5 && vCy > uLayerClip.y + 0.5) discard;
   /*CUTOUT*/
-  // uShadeMix: 1.0 = full vanilla directional shade (opaque blocks); transparent
-  // materials (water) soften toward 1.0 — vanilla's 0.5 bottom-face shade makes
-  // water read near-black when looked at from below ("dark blue from underneath")
-  outColor = vec4(c.rgb * mix(1.0, vShade, uShadeMix), /*ALPHA*/);
+  outColor = vec4(c.rgb * uTint * mix(1.0, vShade, uShadeMix) + emission, /*ALPHA*/);
   #ifdef TONE_MAPPING
     outColor.rgb = toneMapping(outColor.rgb);
   #endif
@@ -434,36 +463,43 @@ void main() {
 }`;
 
 /** Fresh material per mesh (uniforms carry per-mesh textures; the compiled program is
- *  shared automatically by three's program cache). */
-/** Liquid animation frames as array-texture layers, registered by AssetLoader at
- * atlas build (fable design: hardware RepeatWrapping per layer — no atlas bleed). */
-export const liquidFrameTextures: {
-	water: THREE.DataArrayTexture | null;
-	waterFlow: THREE.DataArrayTexture | null;
-	lava: THREE.DataArrayTexture | null;
-	lavaFlow: THREE.DataArrayTexture | null;
-	waterOverlay: THREE.DataArrayTexture | null;
-} = {
-	water: null,
-	waterFlow: null,
-	lava: null,
-	lavaFlow: null,
-	waterOverlay: null,
-};
-
-export function makePullMaterial(transparent: boolean, quad = false): THREE.ShaderMaterial {
-	// discard kills early-Z on the OPAQUE pass (measured: 320ms/frame up close on 30M
-	// tris) — the solid material is discard-free; only the transparent pass keeps cutout
-	const frag = transparent
-		? PULL_FRAG_BASE.replace("/*CUTOUT*/", "if (c.a < 0.5) discard;").replace("/*ALPHA*/", "c.a")
-		: PULL_FRAG_BASE.replace("/*CUTOUT*/", "").replace("/*ALPHA*/", "1.0");
-	return new THREE.ShaderMaterial({
+ * shared automatically by three's program cache). */
+export function makePullMaterial(
+	source: boolean | THREE.Material,
+	quad = false,
+	fallbackMap: THREE.Texture | null = null
+): THREE.ShaderMaterial {
+	const material = typeof source === "boolean" ? undefined : source;
+	const mapped = material as THREE.MeshStandardMaterial | undefined;
+	const transparent =
+		typeof source === "boolean" ? source : source.transparent || source.opacity < 1;
+	const opacity = material?.opacity ?? 1;
+	const alphaTest = material?.alphaTest ?? (transparent ? 0.5 : 0);
+	const depthWrite = material?.depthWrite ?? !transparent;
+	const map = material ? (mapped?.map ?? null) : fallbackMap;
+	const emissiveMap = mapped?.emissiveMap ?? null;
+	const tint = mapped?.color?.clone() ?? new THREE.Color(0xffffff);
+	const emission =
+		mapped?.emissive?.clone()?.multiplyScalar(mapped.emissiveIntensity ?? 1) ??
+		new THREE.Color(0x000000);
+	// No alpha test in the fully opaque fast path; cutouts still write depth, and
+	// true alpha blending retains rather than thresholds the source alpha.
+	const frag = PULL_FRAG_BASE.replace(
+		"/*CUTOUT*/",
+		alphaTest > 0 ? "if (c.a * uBaseOpacity < uAlphaTest) discard;" : ""
+	).replace("/*ALPHA*/", transparent ? "c.a * uOpacity" : "uOpacity");
+	const result = new THREE.ShaderMaterial({
 		glslVersion: THREE.GLSL3,
 		vertexShader: quad ? PULL_VERT_QUAD : PULL_VERT,
 		fragmentShader: frag,
 		transparent,
-		depthWrite: !transparent,
-		side: THREE.FrontSide,
+		opacity,
+		alphaTest,
+		depthWrite,
+		depthTest: material?.depthTest ?? true,
+		side: material?.side ?? THREE.FrontSide,
+		blending: material?.blending ?? THREE.NormalBlending,
+		toneMapped: material?.toneMapped ?? true,
 		forceSinglePass: true,
 		uniforms: {
 			uRecords: { value: null },
@@ -472,19 +508,27 @@ export function makePullMaterial(transparent: boolean, quad = false): THREE.Shad
 			uPos: { value: null },
 			uNrm: { value: null },
 			uUv: { value: null },
-			uAtlas: { value: null },
+			uAtlas: { value: map },
+			uHasMap: { value: map ? 1 : 0 },
+			uAtlasMipCap: { value: material?.userData.useAtlas || (!material && map) ? 4 : -1 },
+			uMapMatrix: { value: new THREE.Matrix3() },
+			uEmissiveMap: { value: emissiveMap },
+			uHasEmissiveMap: { value: emissiveMap ? (emissiveMap === map ? 2 : 1) : 0 },
+			uEmissive: { value: emission },
+			uTint: { value: tint },
+			uOpacity: { value: opacity },
+			uBaseOpacity: { value: opacity },
+			uAlphaTest: { value: alphaTest },
 			uDims: { value: new THREE.Vector3(1, 1, 1) },
 			uPow2: { value: new THREE.Vector4(0, 0, 0, 0) }, // (xMask, xBits, yShift, enabled)
 			uLayerClip: { value: new THREE.Vector2(0, 1e9) },
-			// transparent (water/glass): NO directional shading — vShade varies by face
-			// (top 1.0 / bottom 0.5) which reads as water changing color with view
-			// angle. Opaque blocks keep full vanilla shading for 3D read.
-			uShadeMix: { value: transparent ? 0.0 : 1.0 },
-			uTime: { value: 0 }, // strip animation clock (set per frame in onBeforeRender)
-			uWaterFrames: { value: null },
-			uWaterFramesOn: { value: 0 },
+			uShadeMix: { value: mapped && (mapped as any).isMeshBasicMaterial ? 0 : 1 },
 		},
 	});
+	result.userData.baseOpacity = opacity;
+	result.userData.baseTransparent = transparent;
+	result.userData.baseDepthWrite = depthWrite;
+	return result;
 }
 
 // NOTE: DataTexture requires image.data.length === w*h*components EXACTLY — a shorter
@@ -640,7 +684,7 @@ export function makeQuadIndexBuffer(maxQuads: number): THREE.BufferAttribute {
 
 export function makeRecordMeshes(
 	stream: RecordStream,
-	atlas: THREE.Texture,
+	atlas: THREE.Texture | null,
 	isQuadPair?: (
 		rowA: number,
 		rowB: number
@@ -653,13 +697,32 @@ export function makeRecordMeshes(
 	const nrmTex = makeFloatTex(TW, posH, t.tplNrm);
 	const uvTex = makeFloatTex(TW, posH, t.tplUv);
 	const rowTex = makeUintTex(TW, rowH, t.rowCorners, THREE.RGBAIntegerFormat, "RGBA32UI");
+	// Template textures are shared across a stream; releasing one record mesh
+	// must not destroy those still used by a sibling. Source maps are asset-owned.
+	const sharedTextures = [posTex, nrmTex, uvTex, rowTex];
+	let liveMeshes = 0;
+	const trackResources = (mesh: THREE.Mesh, owned: THREE.Texture[]) => {
+		liveMeshes++;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			owned.forEach((texture) => texture.dispose());
+			if (--liveMeshes === 0) sharedTextures.forEach((texture) => texture.dispose());
+		};
+		mesh.userData.releaseRecordResources = release;
+		mesh.geometry.addEventListener("dispose", release);
+		(mesh.material as THREE.Material).addEventListener("dispose", release);
+	};
 
 	const meshes: THREE.Mesh[] = [];
 	for (const cat of stream.perCategory) {
 		if (cat.tris === 0) continue;
-		const transparent = cat.category !== "solid";
-		const y0 = (cat as any).y0 ?? 0,
-			sh = (cat as any).h ?? stream.sy;
+		const transparent = cat.material
+			? cat.material.transparent || cat.material.opacity < 1
+			: cat.category === "transparent" || cat.category === "water";
+		const y0 = cat.y0 ?? 0,
+			sh = cat.h ?? stream.sy;
 		// quad-merge pass (JS-side; emission stream untouched): pairs of adjacent
 		// same-cell records whose template rows form [a,b,c]+[a,c,d] become ONE quad
 		// record drawn via the shared static index pattern (4 invocations, not 6)
@@ -686,7 +749,7 @@ export function makeRecordMeshes(
 			buf.set(rec);
 			const recTex = makeUintTex(RW, rows, buf, THREE.RGIntegerFormat, "RG32UI");
 			// page table (all-visible initially; onBeforeRender rewrites it per frame)
-			const maxPages = Math.ceil(n / PAGE);
+			const maxPages = sectionPageCount(sections);
 			const pageData = new Uint32Array(PW * Math.ceil(maxPages / PW) * 2);
 			const pageTex = makeUintTex(
 				PW,
@@ -695,12 +758,7 @@ export function makeRecordMeshes(
 				THREE.RGIntegerFormat,
 				"RG32UI"
 			);
-			const material = makePullMaterial(transparent);
-			// WATER depth-writes (vanilla's translucent pass does too): without it,
-			// looking through N stacked water shells alpha-compounds (0.84^N) and the
-			// color shifts with view angle/depth; with it only the front shell blends
-			// — one stable water color from every angle (fable invariance consult)
-			if (cat.category === "water") material.depthWrite = true;
+			const material = makePullMaterial(cat.material ?? transparent, false, atlas);
 			material.uniforms.uRecords.value = recTex;
 			material.uniforms.uRows.value = rowTex;
 			material.uniforms.uPages.value = pageTex;
@@ -719,11 +777,10 @@ export function makeRecordMeshes(
 					ok ? 1 : 0
 				);
 			}
-			material.uniforms.uAtlas.value = atlas;
 			// EMPTY geometry (no attributes — a dummy position would CLAMP the draw);
 			// drawRange carries the vertex count, manual bounds carry culling
 			const geometry = new THREE.BufferGeometry();
-			geometry.setDrawRange(0, Math.ceil(n / PAGE) * PAGE * 3);
+			geometry.setDrawRange(0, maxPages * PAGE * 3);
 			geometry.boundingBox = new THREE.Box3(
 				new THREE.Vector3(-0.51, y0 - 0.51, -0.51),
 				new THREE.Vector3(stream.sx - 0.49, y0 + sh + 0.01, stream.sz - 0.49)
@@ -736,7 +793,8 @@ export function makeRecordMeshes(
 			mesh.frustumCulled = true;
 			mesh.matrixAutoUpdate = false;
 			mesh.updateMatrix();
-			attachSectionCulling(mesh, sections, pageTex, pageData, 3, transparent);
+			attachSectionCulling(mesh, sections, pageTex, pageData, 3);
+			trackResources(mesh, [recTex, pageTex]);
 			meshes.push(mesh);
 		}
 		// quad meshes: shared static index pattern + drawRange in INDEX units. Chunked —
@@ -754,6 +812,7 @@ export function makeRecordMeshes(
 				THREE.RGBAIntegerFormat,
 				"RGBA32UI"
 			);
+			sharedTextures.push(rowTexQ);
 			for (const qchunk of chunkWithSections(quadSec!.rec, quadSec!.sections, QUAD_CHUNK)) {
 				const { rec: qrec, items: nQ, sections: qsections } = qchunk;
 				if (nQ === 0) continue;
@@ -761,8 +820,7 @@ export function makeRecordMeshes(
 				const bufQ = new Uint32Array(rowsQ * RW * 2);
 				bufQ.set(qrec);
 				const recTexQ = makeUintTex(RW, rowsQ, bufQ, THREE.RGIntegerFormat, "RG32UI");
-				const material = makePullMaterial(transparent, true);
-				if (cat.category === "water") material.depthWrite = true; // see tri path note
+				const material = makePullMaterial(cat.material ?? transparent, true, atlas);
 				material.uniforms.uRecords.value = recTexQ;
 				material.uniforms.uRows.value = rowTexQ;
 				material.uniforms.uPos.value = posTex;
@@ -780,8 +838,7 @@ export function makeRecordMeshes(
 						ok ? 1 : 0
 					);
 				}
-				material.uniforms.uAtlas.value = atlas;
-				const maxPagesQ = Math.ceil(nQ / PAGE);
+				const maxPagesQ = sectionPageCount(qsections);
 				const pageDataQ = new Uint32Array(PW * Math.ceil(maxPagesQ / PW) * 2);
 				const pageTexQ = makeUintTex(
 					PW,
@@ -792,8 +849,8 @@ export function makeRecordMeshes(
 				);
 				material.uniforms.uPages.value = pageTexQ;
 				const geometry = new THREE.BufferGeometry();
-				geometry.setIndex(makeQuadIndexBuffer(nQ));
-				geometry.setDrawRange(0, Math.min(Math.ceil(nQ / PAGE) * PAGE * 6, nQ * 6));
+				geometry.setIndex(makeQuadIndexBuffer(maxPagesQ * PAGE));
+				geometry.setDrawRange(0, maxPagesQ * PAGE * 6);
 				geometry.boundingBox = new THREE.Box3(
 					new THREE.Vector3(-0.51, y0 - 0.51, -0.51),
 					new THREE.Vector3(stream.sx - 0.49, y0 + sh + 0.01, stream.sz - 0.49)
@@ -805,12 +862,29 @@ export function makeRecordMeshes(
 				mesh.userData.recordDrawn = nQ;
 				mesh.matrixAutoUpdate = false;
 				mesh.updateMatrix();
-				attachSectionCulling(mesh, qsections, pageTexQ, pageDataQ, 6, transparent);
+				attachSectionCulling(mesh, qsections, pageTexQ, pageDataQ, 6);
+				trackResources(mesh, [recTexQ, pageTexQ]);
 				meshes.push(mesh);
 			}
 		}
 	}
+	if (liveMeshes === 0) sharedTextures.forEach((texture) => texture.dispose());
 	return meshes;
+}
+
+/** Release only the generated record resources; asset maps remain asset-loader owned. */
+export function disposeRecordMeshes(meshes: Iterable<THREE.Object3D>): void {
+	for (const object of meshes) {
+		object.traverse((child) => {
+			const mesh = child as THREE.Mesh;
+			const release = mesh.userData.releaseRecordResources;
+			if (typeof release !== "function") return;
+			release();
+			delete mesh.userData.releaseRecordResources;
+			mesh.geometry.dispose();
+			(mesh.material as THREE.Material).dispose();
+		});
+	}
 }
 
 export function buildRecordTables(

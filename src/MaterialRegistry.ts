@@ -8,6 +8,7 @@ export class MaterialRegistry {
 	private static instance: MaterialRegistry;
 	private materials = new Map<string, THREE.Material>();
 	private materialRefCount = new Map<string, number>();
+	private materialKeys = new WeakMap<THREE.Material, string>();
 
 	private constructor() {}
 
@@ -38,9 +39,11 @@ export class MaterialRegistry {
 
 		// Clone the material to ensure we don't modify the original
 		const sharedMaterial = sourceMaterial.clone();
+		sharedMaterial.userData.registryShared = true;
 		sharedMaterial.name = `shared_${sourceMaterial.name || "material"}_${key.substring(0, 8)}`;
 
 		this.materials.set(key, sharedMaterial);
+		this.materialKeys.set(sharedMaterial, key);
 		this.materialRefCount.set(key, 1);
 
 		return sharedMaterial;
@@ -54,7 +57,19 @@ export class MaterialRegistry {
 		// Cubane assigns unique names (e.g. "minecraft:stone", "minecraft:dirt")
 		// even when they share the same texture atlas and properties.
 		// By ignoring the name, we can merge them into a single shared material.
-		const keyParts: string[] = [material.type];
+		const keyParts: string[] = [
+			material.type,
+			`t:${material.transparent}`,
+			`o:${material.opacity}`,
+			`dw:${material.depthWrite}`,
+			`dt:${material.depthTest}`,
+			`depth:${material.depthFunc}`,
+			`blend:${material.blending}`,
+			`alpha:${material.alphaTest}`,
+			`side:${material.side}`,
+			`water:${!!material.userData.isWater}`,
+			`lava:${!!material.userData.isLava}`,
+		];
 
 		// Add common material properties to the key
 		if (
@@ -70,20 +85,9 @@ export class MaterialRegistry {
 
 			// Map (texture)
 			if ("map" in material && material.map) {
-				// Use texture UUID or image source as part of the key
-				if (material.map.image) {
-					const image = material.map.image as HTMLImageElement;
-					if (image.src) {
-						// For textures loaded from URLs
-						keyParts.push(`map:${image.src}`);
-					} else if (material.map.uuid) {
-						// For generated textures
-						keyParts.push(`map:${material.map.uuid}`);
-					}
-				} else {
-					// Fallback to UUID if image is not accessible
-					keyParts.push(`map:${material.map.uuid}`);
-				}
+				// An image URL alone does not identify a sampler (different animated
+				// strips and UV transforms may share source image pixels).
+				keyParts.push(`map:${material.map.uuid}`);
 			}
 
 			// Transparency and Alpha Test
@@ -107,7 +111,13 @@ export class MaterialRegistry {
 					keyParts.push(`e:${material.emissive.getHexString()}`);
 					keyParts.push(`ei:${material.emissiveIntensity}`);
 				}
+				if (material.emissiveMap) keyParts.push(`em:${material.emissiveMap.uuid}`);
+				if (material.normalMap) keyParts.push(`nm:${material.normalMap.uuid}`);
 			}
+		} else {
+			// Arbitrary shader uniforms and custom materials cannot be reliably
+			// deduplicated by the standard properties alone.
+			keyParts.push(`custom:${material.uuid}`);
 		}
 
 		return keyParts.join("_");
@@ -121,14 +131,7 @@ export class MaterialRegistry {
 	}
 
 	private releaseMaterialReference(material: THREE.Material): void {
-		// Find the key for this material
-		let foundKey: string | null = null;
-		for (const [key, mat] of this.materials.entries()) {
-			if (mat === material) {
-				foundKey = key;
-				break;
-			}
-		}
+		const foundKey = this.materialKeys.get(material);
 
 		if (foundKey) {
 			const refCount = this.materialRefCount.get(foundKey) || 0;
@@ -140,6 +143,7 @@ export class MaterialRegistry {
 				}
 				this.materials.delete(foundKey);
 				this.materialRefCount.delete(foundKey);
+				this.materialKeys.delete(material);
 			} else {
 				// Decrement reference count
 				this.materialRefCount.set(foundKey, refCount - 1);
@@ -191,6 +195,7 @@ export class MaterialRegistry {
 
 		this.materials.clear();
 		this.materialRefCount.clear();
+		this.materialKeys = new WeakMap();
 
 		console.log("[MaterialRegistry] All materials cleared");
 	}

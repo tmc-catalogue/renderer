@@ -5,12 +5,7 @@ import { WorldMeshBuilder } from "../WorldMeshBuilder"; // Adjust the import pat
 import { EventEmitter } from "events";
 import { SceneManager } from "./SceneManager"; // Adjust the import path
 import { SchematicRenderer } from "../SchematicRenderer";
-import {
-	MemoryLeakFix,
-	disposeGroup,
-	clearAllCaches,
-	forceGarbageCollection,
-} from "../utils/MemoryLeakFix";
+import { MemoryLeakFix, clearAllCaches, forceGarbageCollection } from "../utils/MemoryLeakFix";
 import { GeometryBufferPool } from "../GeometryBufferPool";
 import { performanceMonitor } from "../performance/PerformanceMonitor";
 interface LoadingProgress {
@@ -412,14 +407,8 @@ export class SchematicManager {
 			// Remove from map first to prevent any new operations on this schematic
 			this.schematics.delete(name);
 
-			// Get meshes - if this fails, at least the schematic is removed from the map
-			const meshes = await schematicObject.getMeshes();
-			console.log("Before removal - scene children:", this.sceneManager.scene.children.length);
-			console.log("Meshes to remove:", meshes.length);
-
-			// Use the enhanced disposal method for comprehensive cleanup
-			schematicObject.disposeSurfaceResources();
-			disposeGroup(schematicObject.group);
+			// Stop in-flight edits and staged meshes before releasing their resources.
+			await schematicObject.dispose();
 
 			// Additional cleanup for any remaining references
 			if (schematicObject.group.parent) {

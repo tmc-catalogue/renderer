@@ -140,6 +140,74 @@ describe("connected glass surfaces", () => {
 			)
 		).toBe(true);
 	});
+	it("writes depth for binary glass borders but blends partially transparent glass", () => {
+		const map = new THREE.Texture();
+		const cutout = makeGlassMaterial(
+			map,
+			true,
+			undefined,
+			new THREE.MeshStandardMaterial({ alphaTest: 0.5 })
+		);
+		expect(cutout.transparent).toBe(false);
+		expect(cutout.depthWrite).toBe(true);
+		expect(cutout.alphaTest).toBe(0.5);
+		const stained = makeGlassMaterial(
+			map,
+			true,
+			undefined,
+			new THREE.MeshStandardMaterial({ transparent: true, alphaTest: 0.01, depthWrite: false })
+		);
+		expect(stained.transparent).toBe(true);
+		expect(stained.depthWrite).toBe(false);
+		cutout.dispose();
+		stained.dispose();
+		map.dispose();
+	});
+	it("partitions mixed alpha glass into mutually exclusive depth-writing and blended passes", () => {
+		const source = new THREE.MeshStandardMaterial({
+			transparent: true,
+			alphaTest: 0.01,
+			depthWrite: false,
+		});
+		source.userData.alphaClass = "blend";
+		source.userData.hasOpaquePixels = true;
+		const texture = new THREE.Texture();
+		const material = makeGlassMaterial(texture, true, undefined, source);
+		const meshes = buildGlassMeshes(
+			() => "red_stained_glass",
+			[{ x: 0, y: 0, z: 0, state: "red_stained_glass" }],
+			new Map([["red_stained_glass", faces("red_stained_glass")]]),
+			new Map([["block/red_stained_glass", material]])
+		);
+		// Return air for actual neighbours to expose both passes' geometry.
+		const isolated = buildGlassMeshes(
+			(x, y, z) => (x === 0 && y === 0 && z === 0 ? "red_stained_glass" : undefined),
+			[{ x: 0, y: 0, z: 0, state: "red_stained_glass" }],
+			new Map([["red_stained_glass", faces("red_stained_glass")]]),
+			new Map([["block/red_stained_glass", material]])
+		);
+		expect(meshes).toHaveLength(0);
+		expect(isolated).toHaveLength(2);
+		const [opaque, blend] = isolated.map((mesh) => mesh.material as THREE.Material);
+		expect(opaque).toMatchObject({ transparent: false, depthWrite: true });
+		expect(blend).toMatchObject({ transparent: true, depthWrite: false });
+		for (const [pass, operator] of [
+			[opaque, "<"],
+			[blend, ">="],
+		] as const) {
+			const shader = {
+				uniforms: {},
+				vertexShader: "#include <common>\n#include <begin_vertex>",
+				fragmentShader:
+					"#include <common>\n#include <clipping_planes_fragment>\n#include <map_fragment>\n#include <color_fragment>",
+			};
+			pass.onBeforeCompile(shader as any, null as any);
+			expect(shader.fragmentShader).toContain(`if (glassSourceAlpha ${operator} 0.999) discard;`);
+		}
+		material.dispose();
+		texture.dispose();
+		isolated.forEach((mesh) => mesh.geometry.dispose());
+	});
 	it("only takes ownership of glass and actual portal blocks", () => {
 		expect(isSurfaceBlock("minecraft:nether_portal[axis=z]")).toBe(true);
 		expect(isSurfaceBlock("minecraft:end_portal")).toBe(true);

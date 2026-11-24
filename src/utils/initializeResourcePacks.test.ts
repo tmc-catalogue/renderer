@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { initializeResourcePacks } from "./initializeResourcePacks";
+import { initializeResourcePacks, reloadEnabledResourcePacks } from "./initializeResourcePacks";
 import type { Cubane } from "../cubane/Cubane";
 import type { ResourcePackManager } from "../managers/ResourcePackManager";
 
@@ -25,6 +25,22 @@ function fixture(restored: string[] = [], enabled = ["tweaks", "vanilla"], count
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+it("reloads the existing asset pipeline once, preserving pack priority and closing failed batches", async () => {
+	const { cubane, manager, desired } = fixture(["old"]);
+	const reload = () =>
+		reloadEnabledResourcePacks(
+			cubane as unknown as Cubane,
+			manager as unknown as ResourcePackManager
+		);
+	await reload();
+	expect(cubane.removeAllPacks).toHaveBeenCalledOnce();
+	expect(cubane.loadResourcePack.mock.calls).toEqual([[desired[1].blob], [desired[0].blob]]);
+	expect(cubane.endPackBatchUpdate).toHaveBeenCalledOnce();
+	cubane.loadResourcePack.mockRejectedValueOnce(new Error("bad pack"));
+	await expect(reload()).rejects.toThrow("bad pack");
+	expect(cubane.endPackBatchUpdate).toHaveBeenCalledTimes(2);
+});
 
 describe("resource pack startup", () => {
 	it.each([0, 1, 2])(

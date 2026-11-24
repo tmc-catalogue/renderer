@@ -1,0 +1,131 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Renderer backend parity</title>
+<style>body{margin:0;background:#172033;color:#e7edf8;font:14px system-ui}pre{padding:16px;white-space:pre-wrap}canvas{display:block;width:100%;height:420px}</style></head>
+<body><pre id="report">Loading backend parity fixture…</pre><canvas id="canvas"></canvas>
+<script type="module">
+import * as THREE from "three";
+import { SchematicRenderer } from "../../src/SchematicRenderer";
+import { SchematicWrapper } from "nucleation";
+import { demoResourcePacks } from "./scripts/demo-packs";
+import { makeRecordMeshes, disposeRecordMeshes } from "../../src/meshing/RecordRenderer";
+
+const params = new URLSearchParams(location.search);
+const mode = params.get("mode") || "batched";
+const wasm = params.get("wasm") !== "false";
+const report = document.getElementById("report");
+const lines = [`${mode} (wasm=${wasm})`];
+function check(condition, name) {
+ if (!condition) throw new Error(name);
+ lines.push(`PASS ${name}`); report.textContent = lines.join("\n");
+}
+
+new SchematicRenderer(document.getElementById("canvas"), {}, demoResourcePacks, {
+ meshBuildingMode:mode, wasmMeshBuilderOptions:{enabled:wasm}, enableProgressBar:false,
+ enableGizmos:false, showGrid:false, showAxes:false, enableAnimatedTextures:false,
+ callbacks:{onRendererInitialized:r=>run(r).catch(error=>{report.textContent=lines.join("\n")+"\nFAIL "+error.stack; console.error(error);})}
+});
+
+async function run(renderer) {
+ const schematic = new SchematicWrapper();
+ schematic.set_block(0,0,0,"minecraft:obsidian");
+ schematic.set_block(1,0,0,"minecraft:stone");
+ schematic.set_block(16,0,0,"minecraft:packed_ice");
+ schematic.set_block(31,0,0,"minecraft:blue_ice");
+ const start=performance.now();
+ await renderer.schematicManager.loadSchematic("opaque-parity",schematic);
+ const object=renderer.schematicManager.getSchematic("opaque-parity");
+ await object.getMeshes();
+ lines.push(`build ${Math.round(performance.now()-start)} ms`);
+ if(mode.startsWith("gpu")) check(object.gpuBuilt,"GPU selected without fallback");
+ const materials=()=>object.meshes.flatMap(m=>Array.isArray(m.material)?m.material:[m.material]).filter(Boolean);
+ const triangleCount=()=>object.meshes.reduce((n,m)=>{
+  if(!m.isMesh) return n;
+  if(m.userData.releaseRecordResources) return n+m.userData.recordDrawn*(m.geometry.index?2:1);
+  const count=m.geometry.index?.count ?? m.geometry.getAttribute("position")?.count ?? 0;
+  return n+count/3*(m.isInstancedMesh?m.count:1);
+ },0);
+ check(triangleCount()===44,`44 opaque triangles across separated sections (actual ${triangleCount()})`);
+ check(materials().every(m=>!m.transparent && m.depthWrite && m.alphaTest===0),"Obsidian, stone and both ice types are opaque depth writers");
+ const camera=new THREE.OrthographicCamera(-100,100,100,-100,0.1,200);
+ object.group.updateMatrixWorld(true); camera.position.copy(object.group.getWorldPosition(new THREE.Vector3())).add(new THREE.Vector3(16,0,60));
+ camera.lookAt(camera.position.clone().add(new THREE.Vector3(0,0,-1))); camera.updateMatrixWorld(true);
+ for(const m of object.meshes.filter(m=>m.userData.releaseRecordResources)) {
+  m.onBeforeRender(renderer.renderManager.renderer,renderer.sceneManager.scene,camera,m.geometry,m.material,null);
+  const p=m.material.uniforms.uPages.value.image.data, items=m.geometry.drawRange.count/(m.geometry.index?6:3);
+  let submitted=0;
+  for(let i=0;i<items;i++) if(i%64<p[2*Math.floor(i/64)+1])submitted++;
+  check(submitted===m.userData.recordDrawn,"Record pages submit every visible primitive");
+ }
+ object.opacity=.2; object.updateMeshMaterials("opacity");
+ check(materials().every(m=>m.transparent && !m.depthWrite && Math.abs(m.opacity-.2)<1e-6),"Schematic fade keeps original material identity");
+ object.opacity=1; object.updateMeshMaterials("opacity");
+ check(materials().every(m=>!m.transparent && m.depthWrite),"Opacity restoration recovers solid pass");
+ object.renderingBounds.enabled=true;
+ object.renderingBounds.min.set(0,0,0); object.renderingBounds.max.set(2,1,1);
+ await object.rebuildMesh();
+ check(triangleCount()===20,`Rendering bounds leave exactly two touching cubes (actual ${triangleCount()})`);
+ renderer.renderManager.render();
+ const errors=renderer.renderManager.renderer.info.programs?.filter(p=>p.diagnostics?.runnable===false)||[];
+ check(!errors.length,"All render shaders compile");
+ recordPixelCheck(renderer.renderManager.renderer);
+ if(mode === "incremental") await incrementalSeamCheck(renderer);
+ if(params.has("benchmark")) {
+  await renderer.schematicManager.removeAllSchematics();
+  for(const name of ["cubes_64x48x64","stress_64x48x64"]) {
+   const data=await (await fetch(`/schematics/${name}.litematic`)).arrayBuffer();
+   const start=performance.now();
+   await renderer.schematicManager.loadSchematic(name,data);
+   const built=renderer.schematicManager.getSchematic(name); await built.getMeshes();
+   const buildMs=performance.now()-start;
+   if(mode.startsWith("gpu")) check(built.gpuBuilt,`${name}: GPU benchmark did not fall back`);
+   const times=[]; for(let i=0;i<6;i++) {const t=performance.now();renderer.renderManager.render();if(i)times.push(performance.now()-t);}
+   times.sort((a,b)=>a-b);
+   lines.push(`BENCH ${name}: build ${Math.round(buildMs)} ms, median CPU frame submission ${times[2].toFixed(2)} ms, ${built.meshes.length} meshes`);
+   await renderer.schematicManager.removeSchematic(name);
+  }
+ }
+ lines.push("COMPLETE"); report.textContent=lines.join("\n");
+}
+
+async function incrementalSeamCheck(renderer) {
+ const schematic = new SchematicWrapper();
+ schematic.set_block(15,0,0,"minecraft:stone");
+ schematic.set_block(16,0,0,"minecraft:stone");
+ schematic.set_block(48,0,0,"minecraft:stone");
+ await renderer.schematicManager.loadSchematic("incremental-seam",schematic);
+ const object = renderer.schematicManager.getSchematic("incremental-seam");
+ await object.getMeshes();
+ const count = () => object.meshes.reduce((total,mesh) => total+(mesh.geometry?.index?.count ?? 0)/3,0);
+ const distant = object.getChunkObjectsAt(3,0,0);
+ check(count()===32 && distant?.length,"Initial mesh culls the shared face across the seam");
+ await object.setBlock([15,0,0],"minecraft:air");
+ check(count()===24,"Removing a seam block exposes the neighboring face");
+ await object.setBlock([15,0,0],"minecraft:stone");
+ check(count()===32,"Restoring a seam block culls both shared faces");
+ check(object.getChunkObjectsAt(3,0,0)===distant,"Seam edits preserve the distant chunk");
+ await renderer.schematicManager.removeSchematic("incremental-seam");
+}
+
+// This exercises the real WebGL pulling shader and shader-generated vertices
+// independently of the browser's WebGPU compute adapter limits.
+function recordPixelCheck(gl) {
+ const texture=new THREE.DataTexture(new Uint8Array([255,255,255,255]),1,1); texture.needsUpdate=true;
+ const source=new THREE.MeshBasicMaterial({map:texture,color:0xff0000,side:THREE.DoubleSide,toneMapped:false});
+ const tables={rowCorners:new Uint32Array([0,1,2,0,0,2,3,0]),rows:2,verts:4,
+  tplPos:new Float32Array([-.4,-.4,0,0,.4,-.4,0,0,.4,.4,0,0,-.4,.4,0,0]),
+  tplNrm:new Float32Array([0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0]),
+  tplUv:new Float32Array([.5,.5,0,0,.5,.5,0,0,.5,.5,0,0,.5,.5,0,0])};
+ const cells=[0,16,31]; const records=Uint32Array.from(cells.flatMap(cell=>[cell,0,cell,1]));
+ const meshes=makeRecordMeshes({tables,sx:32,sy:1,sz:1,perCategory:[{category:"solid",records,tris:6,material:source}]},null,(a,b)=>({quad:a===0&&b===1,corners:[0,1,2,3]}));
+ const scene=new THREE.Scene(); scene.background=new THREE.Color(0x000000); scene.add(...meshes);
+ const camera=new THREE.OrthographicCamera(-16.5,16.5,2,-2,.1,100);camera.position.set(15.5,0,10);camera.lookAt(15.5,0,0);camera.updateMatrixWorld();
+ const target=new THREE.WebGLRenderTarget(330,40), old=gl.getRenderTarget();
+ try {
+  gl.setRenderTarget(target);gl.render(scene,camera);
+  for(const cell of cells) {
+   const rgba=new Uint8Array(4); gl.readRenderTargetPixels(target,(cell+1)*10,20,1,1,rgba);
+   check(rgba[0]>100&&rgba[1]<30&&rgba[2]<30,`Record shader renders tinted quad in section at x=${cell} (RGBA ${[...rgba]})`);
+  }
+ } finally {gl.setRenderTarget(old);target.dispose();disposeRecordMeshes(meshes);source.dispose();texture.dispose();}
+}
+</script></body></html>

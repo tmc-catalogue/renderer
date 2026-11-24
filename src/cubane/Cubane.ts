@@ -57,6 +57,9 @@ export class Cubane {
 	private blockMeshCache: Map<string, THREE.Object3D> = new Map();
 	private entityMeshCache: Map<string, THREE.Object3D> = new Map();
 	private optimizationDataCache: Map<string, BlockOptimizationData> = new Map();
+	private meshCacheGeneration = 0;
+	private meshAssetGeneration = -1;
+	private disposed = false;
 
 	// Block entity mapping for blocks that are *purely* entities
 	private pureBlockEntityMap: Record<string, string> = {
@@ -733,8 +736,20 @@ export class Cubane {
 		if (!this.initialized) {
 			await this.initPromise;
 		}
+		if (this.disposed) return new THREE.Group();
+		const generation = this.getMeshCacheGeneration();
 
 		const cacheKey = `${blockString}:${biome}`;
+		const finish = (
+			mesh: THREE.Object3D,
+			cache = useCache
+		): THREE.Object3D | Promise<THREE.Object3D> => {
+			if (this.disposed) return new THREE.Group();
+			if (generation !== this.getMeshCacheGeneration())
+				return this.getBlockMesh(blockString, biome, useCache, nbtData);
+			if (cache) this.blockMeshCache.set(cacheKey, mesh.clone());
+			return mesh;
+		};
 
 		if (useCache && this.blockMeshCache.has(cacheKey)) {
 			const cachedMesh = this.blockMeshCache.get(cacheKey)!;
@@ -758,7 +773,7 @@ export class Cubane {
 				block.properties ?? {},
 				nbtData
 			);
-			if (signMesh) return signMesh;
+			if (signMesh) return finish(signMesh, false);
 			// Fall through to default handling if the sign couldn't be built.
 		}
 
@@ -769,10 +784,7 @@ export class Cubane {
 		) {
 			const { buildChestBlockMesh } = await import("../meshing/ChestModels");
 			const chest = await buildChestBlockMesh(blockString, this.assetLoader);
-			if (chest) {
-				if (useCache) this.blockMeshCache.set(cacheKey, chest.clone());
-				return chest;
-			}
+			if (chest) return finish(chest);
 		}
 
 		if (
@@ -780,8 +792,7 @@ export class Cubane {
 		) {
 			const { buildCopperGolemStatue } = await import("../meshing/CopperGolemModels");
 			const statue = await buildCopperGolemStatue(blockId, block.properties, this.assetLoader);
-			if (useCache) this.blockMeshCache.set(cacheKey, statue.clone());
-			return statue;
+			return finish(statue);
 		}
 
 		if (this.pureBlockEntityMap[blockId]) {
@@ -789,11 +800,7 @@ export class Cubane {
 
 			// For pure entities, the entityMesh is the final block mesh.
 			// It might already have its own internal origin and structure.
-			if (useCache) {
-				// Clone before caching as getEntityMesh might also return a clone from its cache
-				this.blockMeshCache.set(cacheKey, entityMesh.clone());
-			}
-			return entityMesh; // Already cloned if from entity cache, or the original if newly created
+			return finish(entityMesh);
 		}
 
 		const rootGroup = new THREE.Group();
@@ -808,14 +815,13 @@ export class Cubane {
 					try {
 						const modelJson = await this.assetLoader.getModel(modelData.model);
 
-						// --- MODIFICATION START ---
-						// Pass only uvlock and block data for BlockMeshBuilder to use internally.
-						// x and y rotations will be applied to the object returned by BlockMeshBuilder.
+						// Geometry rotation is applied below; pass the same angles to the
+						// builder so it can compensate UV-locked faces before atlas mapping.
 						const baseBlockPartObject = await this.blockMeshBuilder.createBlockMesh(
 							modelJson,
 							{
-								// x: undefined, // Explicitly not passing x rotation
-								// y: undefined, // Explicitly not passing y rotation
+								x: modelData.x,
+								y: modelData.y,
 								uvlock: modelData.uvlock,
 							},
 							block, // Pass block data for context
@@ -905,22 +911,13 @@ export class Cubane {
 			// The fallback mesh is simple and has no internal rotations to worry about.
 			// If you cache it, clone it.
 			const fallback = this.createFallbackMesh(`block_fallback_${blockId}`);
-			if (useCache) {
-				this.blockMeshCache.set(cacheKey, fallback.clone());
-			}
-			return fallback;
-		}
-
-		if (useCache) {
-			// The rootGroup now contains all parts, correctly transformed.
-			// Cache a clone of this assembled rootGroup.
-			this.blockMeshCache.set(cacheKey, rootGroup.clone());
+			return finish(fallback);
 		}
 
 		// rootGroup itself is at origin (0,0,0) with no rotation.
 		// Its children (the block parts) have their blockstate rotations.
 		// The meshes within those children have their element rotations baked into vertices.
-		return rootGroup;
+		return finish(rootGroup);
 	}
 
 	/**
@@ -936,6 +933,15 @@ export class Cubane {
 		if (!this.initialized) {
 			await this.initPromise;
 		}
+		if (this.disposed) return new THREE.Group();
+		const generation = this.getMeshCacheGeneration();
+		const finish = (mesh: THREE.Object3D): THREE.Object3D | Promise<THREE.Object3D> => {
+			if (this.disposed) return new THREE.Group();
+			if (generation !== this.getMeshCacheGeneration())
+				return this.getEntityMesh(entityType, useCache);
+			if (useCache) this.entityMeshCache.set(entityType, mesh.clone());
+			return mesh;
+		};
 
 		// Check cache first if enabled
 		if (useCache && this.entityMeshCache.has(entityType)) {
@@ -952,26 +958,16 @@ export class Cubane {
 			if (!mesh) {
 				console.warn(`No mesh created by EntityRenderer for: ${entityType}`);
 				const fallback = this.createFallbackMesh("entity_" + entityType);
-				if (useCache) {
-					this.entityMeshCache.set(entityType, fallback.clone());
-				}
-				return fallback;
+				return finish(fallback);
 			}
 			mesh.name = `entity_${entityType}`;
 			// Keep embedded entity textures: their UV layout differs from pack sheets.
 			// Cache a master clone for subsequent callers.
-			if (useCache) {
-				this.entityMeshCache.set(entityType, mesh.clone());
-			}
-
-			return mesh;
+			return finish(mesh);
 		} catch (error) {
 			console.error(`Error creating entity mesh ${entityType}:`, error);
 			const fallback = this.createFallbackMesh("entity_" + entityType);
-			if (useCache) {
-				this.entityMeshCache.set(entityType, fallback.clone());
-			}
-			return fallback;
+			return finish(fallback);
 		}
 	}
 
@@ -979,6 +975,8 @@ export class Cubane {
 	 * Clear all mesh caches
 	 */
 	public clearMeshCaches(): void {
+		this.meshCacheGeneration++;
+		this.meshAssetGeneration = this.assetLoader.getResourceGeneration();
 		this.signRenderer.clearCache();
 		this.blockMeshCache.clear();
 		this.entityMeshCache.clear();
@@ -986,10 +984,17 @@ export class Cubane {
 		console.log("Cubane: All caches cleared");
 	}
 
+	private getMeshCacheGeneration(): number {
+		if (this.meshAssetGeneration !== this.assetLoader.getResourceGeneration())
+			this.clearMeshCaches();
+		return this.meshCacheGeneration;
+	}
+
 	/**
 	 * Clear block mesh cache only
 	 */
 	public clearBlockMeshCache(): void {
+		this.meshCacheGeneration++;
 		this.blockMeshCache.clear();
 		console.log("Cubane: Block mesh cache cleared");
 	}
@@ -998,6 +1003,7 @@ export class Cubane {
 	 * Clear entity mesh cache only
 	 */
 	public clearEntityMeshCache(): void {
+		this.meshCacheGeneration++;
 		this.entityMeshCache.clear();
 		console.log("Cubane: Entity mesh cache cleared");
 	}
@@ -1110,7 +1116,7 @@ export class Cubane {
 		const modelJson = await this.assetLoader.getModel(primaryModel.model);
 		const faceData = await this.blockMeshBuilder.createOptimizedFaceData(
 			modelJson,
-			{ uvlock: primaryModel.uvlock },
+			{ uvlock: primaryModel.uvlock, x: primaryModel.x, y: primaryModel.y },
 			block,
 			biome
 		);
@@ -1227,6 +1233,7 @@ export class Cubane {
 		if (!this.initialized) {
 			await this.initPromise;
 		}
+		const generation = this.getMeshCacheGeneration();
 
 		const cacheKey = `opt_${blockString}:${biome}`;
 
@@ -1271,7 +1278,9 @@ export class Cubane {
 			optimizationData = await this.analyzeModelGeometry(modelDataList, block, biome);
 		}
 
-		if (useCache) {
+		if (generation !== this.getMeshCacheGeneration() && !this.disposed)
+			return this.getBlockOptimizationData(blockString, biome, useCache);
+		if (useCache && !this.disposed) {
 			this.optimizationDataCache.set(cacheKey, optimizationData);
 		}
 
@@ -1368,6 +1377,7 @@ export class Cubane {
 	 * Clear optimization cache
 	 */
 	public clearOptimizationCache(): void {
+		this.meshCacheGeneration++;
 		this.optimizationDataCache.clear();
 	}
 
@@ -1397,6 +1407,7 @@ export class Cubane {
 		return this.entityRenderer;
 	}
 	public dispose(): void {
+		this.disposed = true;
 		this.assetLoader.dispose();
 		this.clearMeshCaches();
 		this.signRenderer.dispose();

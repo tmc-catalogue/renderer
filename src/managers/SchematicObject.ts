@@ -37,12 +37,16 @@ import {
 import { buildEndPortalMesh, makeEndPortalMaterial } from "../meshing/EndPortal";
 import { fluidPaletteStates } from "../meshing/FluidStateLookup";
 import { bakeStaticModelParts } from "../meshing/StaticModelParts";
+import { extractVisibleGrid } from "../meshing/VisibleGrid";
+import { applySchematicOpacity, type MaterialState } from "../meshing/SchematicMaterials";
+import { disposeRecordMeshes } from "../meshing/RecordRenderer";
 
 // Define chunk data interface to fix TypeScript errors
 
 import { EditableRegionHighlight } from "./highlight/EditableRegionHighlight";
 
 export class SchematicObject extends EventEmitter {
+	private static readonly builderQueues = new WeakMap<WorldMeshBuilder, Promise<void>>();
 	// ... existing imports and properties ...
 	public name: string;
 	public schematicWrapper: SchematicWrapper;
@@ -62,6 +66,12 @@ export class SchematicObject extends EventEmitter {
 	private animatedSurfaces: THREE.Mesh[] = [];
 	private surfaceViewBox = new THREE.Box3();
 	private editQueue: Promise<void> = Promise.resolve();
+	private materialStates = new WeakMap<THREE.Material, MaterialState>();
+	private materialCopies = new WeakMap<THREE.Material, THREE.Material>();
+	private ownedMaterialCopies = new Set<THREE.Material>();
+	private hasBuiltMeshes = false;
+	private visibilityBuildPending = false;
+	private disposed = false;
 
 	public get hasAnimatedSurfaces(): boolean {
 		return (
@@ -266,6 +276,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Apply custom rendering bounds if provided
 		if (properties?.renderingBounds) {
+			this.renderingBounds.enabled = true;
 			if (Array.isArray(properties.renderingBounds.min)) {
 				this.renderingBounds.min = new THREE.Vector3(
 					properties.renderingBounds.min[0],
@@ -385,7 +396,6 @@ export class SchematicObject extends EventEmitter {
 	 * This avoids interference with Three.js internal matrix properties
 	 */
 	// Timer is assigned in setupPropertyWatchers and used internally
-	// @ts-expect-error Timer is assigned and used internally for change detection
 	private _propertyWatcherTimer: ReturnType<typeof setTimeout> | null = null;
 
 	private setupPropertyWatchers(): void {
@@ -398,6 +408,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Set up property change detection
 		const checkForChanges = () => {
+			if (this.disposed) return;
 			// Check position
 			if (!this.position.equals(lastPosition)) {
 				lastPosition = this.position.clone();
@@ -519,6 +530,7 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private emitPropertyChanged(property: string, value: any) {
+		this.schematicRenderer.invalidate?.();
 		this.eventEmitter.emit("schematicPropertyChanged", {
 			schematic: this,
 			property,
@@ -546,53 +558,35 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private applyPropertiesToObjects(objects: THREE.Object3D[]) {
-		// Determine if the SCHEMATIC ITSELF needs to be faded
-		const schematicWantsFade = this.opacity < 1.0;
-
-		objects.forEach((obj) => {
-			const surface = !!obj.userData.surfaceMesh;
-			// Surface sections may be rebuilt while hidden; group visibility owns hiding.
-			obj.visible = surface || this.visible;
-
-			if (this.visible || surface) {
-				obj.traverse((child) => {
-					if (child instanceof THREE.Mesh) {
-						child.castShadow = true;
-						child.receiveShadow = true;
-						child.frustumCulled = true;
-
-						const materials = Array.isArray(child.material) ? child.material : [child.material];
-
-						materials.forEach((mat) => {
-							if (mat) {
-								// If the schematic is being faded, apply its opacity.
-								// Otherwise, let the material keep its original opacity.
-								if (surface) {
-									mat.opacity = this.opacity;
-									const transparent = schematicWantsFade || !!mat.userData.surfaceTransparent;
-									if (mat.transparent !== transparent) {
-										mat.transparent = transparent;
-										mat.needsUpdate = true;
-									}
-								} else if (schematicWantsFade) {
-									mat.opacity = this.opacity;
-								}
-								if (mat instanceof THREE.ShaderMaterial && mat.userData.fluidAlpha !== undefined) {
-									mat.uniforms.uAlpha.value = mat.userData.fluidAlpha * this.opacity;
-								}
-
-								// CRITICAL FIX: Only set transparent = true if the schematic
-								// is being faded. NEVER set it to false, because that would
-								// override materials that are inherently transparent (like glass).
-								if (schematicWantsFade) {
-									mat.transparent = true;
-								}
-							}
-						});
-					}
-				});
+		this.materialStates ??= new WeakMap();
+		this.materialCopies ??= new WeakMap();
+		this.ownedMaterialCopies ??= new Set();
+		// Shared registry materials are cloned once per schematic, never once per mesh.
+		const own = (source: THREE.Material) => {
+			if (!source.userData.registryShared) return source;
+			let material = this.materialCopies.get(source);
+			if (!material) {
+				material = source.clone();
+				material.userData.registryShared = false;
+				material.userData.schematicOwned = true;
+				this.materialCopies.set(source, material);
+				this.ownedMaterialCopies.add(material);
 			}
-		});
+			return material;
+		};
+		for (const obj of objects) {
+			obj.traverse((child) => {
+				if (!(child instanceof THREE.Mesh)) return;
+				child.castShadow = true;
+				child.receiveShadow = true;
+				child.frustumCulled = true;
+				child.material = Array.isArray(child.material)
+					? child.material.map(own)
+					: own(child.material);
+				for (const material of Array.isArray(child.material) ? child.material : [child.material])
+					applySchematicOpacity(material, this.opacity, this.materialStates);
+			});
+		}
 	}
 
 	/**
@@ -710,25 +704,24 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private async buildMeshes(): Promise<void> {
-		if (!this.visible) {
+		if (!this.visible || this.disposed) {
 			return;
 		}
 
-		const { meshes, chunkMap } = await this.buildSchematicMeshes(this, this.chunkDimensions);
+		const { meshes, chunkMap } = await this.withBuilder(async () => {
+			if (this.disposed) return { meshes: [], chunkMap: new Map() };
+			const result = await this.buildSchematicMeshes(this, this.chunkDimensions);
+			// Sign block entities are rendered independently of the meshing backend.
+			try {
+				const signMeshes = await this.worldMeshBuilder.buildSignMeshes(this);
+				result.meshes.push(...(signMeshes as THREE.Mesh[]));
+			} catch (e) {
+				console.warn("[SchematicObject] sign build failed", e);
+			}
+			this.applyPropertiesToObjects(result.meshes);
+			return result;
+		});
 		this.chunkMeshes = chunkMap;
-
-		// Sign block entities are rendered in a mode-independent pass (the batched/
-		// instanced build paths don't process block entities, and signs need both their
-		// per-instance NBT text and blockstate facing/rotation).
-		try {
-			const signMeshes = await this.worldMeshBuilder.buildSignMeshes(this);
-			meshes.push(...(signMeshes as THREE.Mesh[]));
-		} catch (e) {
-			console.warn("[SchematicObject] sign build failed", e);
-		}
-
-		// Apply properties to all objects
-		this.applyPropertiesToObjects(meshes);
 
 		// Add to group. GPU record meshes stage in time-boxed batches: each batch renders
 		// once before the next adds, spreading the record-texture GPU uploads (the boss's
@@ -736,26 +729,31 @@ export class SchematicObject extends EventEmitter {
 		const gpuMeshes = meshes.filter((m) => (m as any).userData?.gpuBuilt);
 		const rest = meshes.filter((m) => !(m as any).userData?.gpuBuilt);
 		rest.forEach((obj) => this.group.add(obj));
+		this.meshes = meshes as THREE.Mesh[];
 		if (gpuMeshes.length > 6) {
 			let i = 0;
-			const step = () => {
+			while (i < gpuMeshes.length && !this.disposed) {
 				const t0 = performance.now();
+				this.group.add(gpuMeshes[i++]);
 				while (i < gpuMeshes.length && performance.now() - t0 < 8) this.group.add(gpuMeshes[i++]);
 				try {
 					this.schematicRenderer.renderManager?.render();
 				} catch {
 					/* rendering is best-effort during staging */
 				}
-				if (i < gpuMeshes.length) setTimeout(step, 0);
-			};
-			step();
+				if (i < gpuMeshes.length) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			}
 		} else {
 			gpuMeshes.forEach((obj) => this.group.add(obj));
 		}
 
 		this.updateTransform(); // This will apply position, rotation, and scale to the group
-		this.group.visible = this.visible;
-		this.meshes = meshes as THREE.Mesh[]; // Keep for backward compatibility
+		this.group.visible = this.visible && this.opacity > 0;
+		if (this.disposed) {
+			this.clearBuiltMeshes();
+			return;
+		}
+		this.hasBuiltMeshes = true;
 		this.animatedSurfaces = this.meshes.filter((mesh) => mesh.userData.animatedSurface);
 
 		this.group.updateMatrixWorld(true);
@@ -767,6 +765,26 @@ export class SchematicObject extends EventEmitter {
 		}
 
 		this.sceneManager.schematicRenderer.options.callbacks?.onSchematicRendered?.(this.name);
+		this.schematicRenderer.invalidate?.();
+	}
+
+	/** Workers and palette tables belong to a renderer, not a schematic. Keep
+	 * different palettes from changing the worker's active template mid-build. */
+	private async withBuilder<T>(operation: () => Promise<T>): Promise<T> {
+		const builder = this.worldMeshBuilder;
+		const prior = SchematicObject.builderQueues.get(builder) ?? Promise.resolve();
+		const run = prior.then(operation);
+		const barrier = run.then(
+			() => {},
+			() => {}
+		);
+		SchematicObject.builderQueues.set(builder, barrier);
+		try {
+			return await run;
+		} finally {
+			if (SchematicObject.builderQueues.get(builder) === barrier)
+				SchematicObject.builderQueues.delete(builder);
+		}
 	}
 
 	// Track chunk building progress
@@ -829,12 +847,15 @@ export class SchematicObject extends EventEmitter {
 
 		try {
 			let result;
+			this.gpuBuilt = false;
 			switch (buildMode) {
 				case "immediate":
 					result = await this.buildSchematicMeshesImmediate(schematicObject, chunkDimensions);
+					result.meshes.push(...(await this.buildFluidSurface(schematicObject)));
 					break;
 				case "incremental":
 					result = await this.buildSchematicMeshesIncremental(schematicObject, chunkDimensions);
+					result.meshes.push(...(await this.buildFluidSurface(schematicObject)));
 					break;
 				case "instanced":
 					result = await this.buildSchematicMeshesInstanced(schematicObject);
@@ -857,6 +878,7 @@ export class SchematicObject extends EventEmitter {
 						}
 						console.warn("[BuildMode] WebGPU unavailable — falling back to batched");
 					} catch (gpuErr) {
+						this.gpuBuilt = false;
 						console.warn("[BuildMode] GPU path failed, falling back to batched:", gpuErr);
 					}
 					result = await this.buildSchematicMeshesBatched(schematicObject, chunkDimensions);
@@ -963,7 +985,7 @@ export class SchematicObject extends EventEmitter {
 
 		const palettes = this.getPalettes(schematic);
 		performanceMonitor.startOperation("Palette Precomputation");
-		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default);
+		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default, true);
 		performanceMonitor.endOperation("Palette Precomputation");
 
 		this.reportBuildProgress("Creating chunk iterator...", 0.1);
@@ -1276,7 +1298,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Initialize pipeline
 		const palettes = this.getPalettes(schematic);
-		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default);
+		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default, true);
 
 		// CRITICAL: Wait for JSZip's async postMessage queue to drain
 		// JSZip uses setImmediate (via postMessage) which continues after await returns
@@ -1556,7 +1578,11 @@ export class SchematicObject extends EventEmitter {
 	private _gpuMeshBuilder: any = null;
 
 	private async getGpuMeshBuilder(): Promise<any> {
-		if (this._gpuMeshBuilder) return this._gpuMeshBuilder.available ? this._gpuMeshBuilder : null;
+		if (this._gpuMeshBuilder) {
+			return this._gpuMeshBuilder.available || (await this._gpuMeshBuilder.init())
+				? this._gpuMeshBuilder
+				: null;
+		}
 		const { GpuMeshBuilder } = await import("../meshing/GpuMeshBuilder");
 		this._gpuMeshBuilder = new GpuMeshBuilder();
 		return (await this._gpuMeshBuilder.init()) ? this._gpuMeshBuilder : null;
@@ -1579,43 +1605,12 @@ export class SchematicObject extends EventEmitter {
 
 		// STEP 1 (same as other modes): palette precompute populates paletteCache
 		const palettes = this.getPalettes(schematic);
-		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default);
+		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default, true);
 
-		// full grid extraction via the same 16³ lazy iterator the other modes use.
-		// Air is skipped BY NAME (palette index 0 is air in our files, but don't assume).
-		const airIdx = new Set<number>();
-		(palettes.default || []).forEach((e: any, i: number) => {
-			if (e?.name === "minecraft:air" || e?.Name === "minecraft:air") airIdx.add(i);
+		const { grid, indexOffset } = extractVisibleGrid(schematic, palettes.default, sx, sy, sz, {
+			bounds: schematicObject.renderingBounds,
+			hiddenCells: this.hiddenCells,
 		});
-		if (airIdx.size === 0) airIdx.add(0); // litematica convention fallback
-		const iterator = schematic.create_lazy_chunk_iterator(16, 16, 16, "bottom_up", 0, 0, 0);
-		const grid = new Uint32Array(sx * sy * sz); // 0 = air; raw palette idx (desc is 1-based with dummy 0)
-		let written = 0;
-		while (iterator.has_next()) {
-			const cd = iterator.next();
-			if (!cd || !cd.blocks) continue;
-			if (cd.blocks instanceof Int32Array || cd.blocks instanceof Uint32Array) {
-				// flat [x, y, z, paletteIdx, …]
-				const b = cd.blocks;
-				for (let i = 0; i + 3 < b.length; i += 4) {
-					if (airIdx.has(b[i + 3])) continue;
-					grid[(b[i + 1] * sz + b[i + 2]) * sx + b[i]] = b[i + 3];
-					written++;
-				}
-			} else {
-				for (const b of cd.blocks) {
-					if (airIdx.has(b[3])) continue;
-					grid[(b[1] * sz + b[2]) * sx + b[0]] = b[3];
-					written++;
-				}
-			}
-		}
-		console.log(
-			`[GpuBuild] grid ${written.toLocaleString()} non-air blocks written; dims=${dimsArr.join(",")}`
-		);
-
-		// inspector support: apply hidden cells; grid is re-extracted on rebuild (not retained)
-		this.applyHiddenCells(grid, sx, sy, sz);
 		this.gpuBuilt = true;
 
 		const tGrid = performance.now() - t0;
@@ -1634,14 +1629,17 @@ export class SchematicObject extends EventEmitter {
 		}
 		const materials = wmb.paletteCache?.globalMaterials || [];
 		const builder = await this.getGpuMeshBuilder();
-		const meshes = await builder.buildMeshes(grid, sx, sy, sz, paletteData, () => materials);
+		const remapped = indexOffset
+			? paletteData.map((p: any) => ({ ...p, index: p.index + indexOffset }))
+			: paletteData;
+		const meshes = await builder.buildMeshes(grid, sx, sy, sz, remapped, () => materials);
 		for (const m of meshes) {
 			this.applyPropertiesToObjects([m]);
 			// static meshes: freeze matrix updates (parent transforms still move them)
 			m.matrixAutoUpdate = false;
 			m.updateMatrix();
-			this.group.add(m);
 		}
+		meshes.push(...(await this.buildFluidSurface(schematicObject)));
 		this.schematicRenderer.invalidate?.();
 		console.log(
 			`[GpuBuild] grid ${tGrid.toFixed(0)}ms + compute total ${(performance.now() - t0).toFixed(0)}ms, ${meshes.length} meshes`
@@ -1681,34 +1679,7 @@ export class SchematicObject extends EventEmitter {
 		//    only for non-atlas materials
 		if (entityCells.length > 0) {
 			const cubane = (this.worldMeshBuilder as any).cubane;
-			const schematic = schematicObject.schematicWrapper;
-			const al: any = cubane.assetLoader;
-			// +π vs the naive table: user-verified chests faced exactly opposite the
-			// expected direction (top ones should face south, bottom east) — the
-			// chest model's "north" texture faces +Z, so every facing rotates 180°
-			const ROT_Y2: Record<string, number> = {
-				north: Math.PI,
-				east: Math.PI / 2,
-				south: 0,
-				west: -Math.PI / 2,
-			};
-			const FV: Record<string, [number, number]> = {
-				north: [0, -1],
-				east: [1, 0],
-				south: [0, 1],
-				west: [-1, 0],
-			};
-			const propsAt2 = (x: number, y: number, z: number) => {
-				try {
-					const bp = schematic.get_block_with_properties?.(x, y, z);
-					// METHOD CALL ONLY (fable): detaching `properties` off a wasm-bindgen
-					// object calls it with this===undefined → TypeError reading
-					// __wbg_ptr → silently {} → bare state names → wire rendered nothing
-					return bp?.properties?.() ?? bp?.properties ?? {};
-				} catch {
-					return {};
-				}
-			};
+			const al = cubane.getAssetLoader?.() ?? cubane.assetLoader;
 			const isChest2 = (b: string) =>
 				/^minecraft:(?:(?:trapped_|ender_)?chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest)(\[|;|$)/.test(
 					b
@@ -1720,17 +1691,12 @@ export class SchematicObject extends EventEmitter {
 				chest: true;
 				positions: Array<{ x: number; y: number; z: number }>;
 			}> = [];
-			const nonChestCells: typeof entityCells = [];
 			const special = new Map<string, typeof entityCells>();
 			for (const c of entityCells) {
-				if (/copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom/.test(c.block)) {
+				if (!isChest2(c.block)) {
 					const cells = special.get(c.block);
 					if (cells) cells.push(c);
 					else special.set(c.block, [c]);
-					continue;
-				}
-				if (!isChest2(c.block)) {
-					nonChestCells.push(c);
 					continue;
 				}
 				// c.block is already the FULL state (extractGpuGrid enriches entityCells
@@ -1765,6 +1731,7 @@ export class SchematicObject extends EventEmitter {
 				let material = ownedSpecialMaterials.get(source);
 				if (!material) {
 					material = source.clone();
+					material.userData.schematicOwned = true;
 					ownedSpecialMaterials.set(source, material);
 				}
 				return material;
@@ -1793,279 +1760,6 @@ export class SchematicObject extends EventEmitter {
 					meshes.push(instances);
 				}
 			}
-
-			const byPos = new Map<string, any>();
-			for (const c of nonChestCells) if (isChest2(c.block)) byPos.set(`${c.x},${c.y},${c.z}`, c);
-			const consumed2 = new Set<string>();
-			const buckets = new Map<
-				string,
-				{
-					state: string;
-					double: boolean;
-					facing: string;
-					chest: boolean;
-					positions: Array<{ x: number; y: number; z: number }>;
-				}
-			>();
-			for (const c of nonChestCells) {
-				const key = `${c.x},${c.y},${c.z}`;
-				if (consumed2.has(key)) continue;
-				// propsAt2 has been observed returning {} DURING the pull build (the
-				// wrapper's get_block_with_properties comes up empty moments after the
-				// identical extractGpuGrid enrichment succeeded) — which strips
-				// c.block's own [props] and hands getBlockMesh a BARE name → multipart
-				// matches nothing → redstone_wire renders nothing. Prefer the state
-				// extractGpuGrid already enriched; live lookup is only a fallback.
-				const props = c.block.includes("[")
-					? Object.fromEntries(
-							c.block
-								.split("[")[1]
-								.replace("]", "")
-								.split(",")
-								.filter(Boolean)
-								.map((kv) => [kv.split("=")[0], kv.split("=")[1]])
-						)
-					: propsAt2(c.x, c.y, c.z);
-				const chest = isChest2(c.block);
-				const facing = props.facing ?? "north";
-				let partner: any = null;
-				if (chest && (props.type === "left" || props.type === "right") && FV[facing]) {
-					const other = props.type === "left" ? "right" : "left";
-					for (const [dx, dz] of [
-						[-FV[facing][1], FV[facing][0]],
-						[FV[facing][1], -FV[facing][0]],
-					]) {
-						const cand = byPos.get(`${c.x + dx},${c.y},${c.z + dz}`);
-						if (cand && !consumed2.has(`${c.x + dx},${c.y},${c.z + dz}`)) {
-							const cp = propsAt2(c.x + dx, c.y, c.z + dz);
-							if (cp.type === other && cp.facing === facing) {
-								partner = cand;
-								break;
-							}
-						}
-					}
-				}
-				consumed2.add(key);
-				if (partner) {
-					consumed2.add(`${partner.x},${partner.y},${partner.z}`);
-				}
-				const pk = Object.keys(props)
-					.filter((k) => k !== "power") // fable: power is tint-only — bucketing on it forks protos 16x
-					.sort()
-					.map((k) => `${k}=${props[k]}`)
-					.join(",");
-				const state = c.block.split(/[;[]/, 1)[0] + (pk ? `[${pk}]` : "");
-				if (!pk)
-					console.warn(
-						`[proto] empty props for ${c.block} @ ${c.x},${c.y},${c.z} — getBlockMesh will get a bare name`
-					);
-				const bk = `${partner ? "double" : "single"}:${state}`;
-				if (!buckets.has(bk))
-					buckets.set(bk, { state, double: !!partner, facing, chest, positions: [] });
-				buckets.get(bk)!.positions.push({
-					x: partner ? (c.x + partner.x) / 2 : c.x,
-					y: c.y,
-					z: partner ? (c.z + partner.z) / 2 : c.z,
-				});
-			}
-			for (const bucket of buckets.values()) {
-				// `type=left/right` (double halves) have no blockstate model — getBlockMesh
-				// returned null for double buckets and their cells vanished entirely.
-				// Build the proto as a SINGLE; the geometry is stretched to double width
-				// at bake time below.
-				const protoState = bucket.state.replace(/type=(left|right)/, "type=single");
-				// getBlockMesh can throw during the early build (texture loads race the
-				// atlas) — a silent catch here made redstone_wire cells VANISH (the
-				// "wire outlines but never renders" bug). Retry with backoff + logging.
-				let proto: any = null;
-				for (let att = 0; att < 4 && !proto; att++) {
-					if (att > 0) await new Promise((res) => setTimeout(res, 600 * att));
-					try {
-						proto = await cubane.getBlockMesh(protoState, "plains", true);
-					} catch (e) {
-						console.warn(`[proto] getBlockMesh attempt ${att + 1} failed for ${protoState}:`, e);
-					}
-				}
-				if (!proto) {
-					// some registries reject the type property entirely — try bare
-					for (let att = 0; att < 3 && !proto; att++) {
-						try {
-							proto = await cubane.getBlockMesh(bucket.state.split("[")[0], "plains", true);
-						} catch (e) {
-							console.warn(`[proto] bare retry failed for ${bucket.state}:`, e);
-						}
-					}
-				}
-				if (!proto) {
-					console.warn(
-						`[proto] no mesh for ${bucket.state} (${bucket.positions.length} cells unrendered)`
-					);
-					continue;
-				}
-				proto.updateWorldMatrix(true, true);
-				const inv = proto.matrixWorld.clone().invert();
-				const parts: Array<{ g: THREE.BufferGeometry; m: any; latch: boolean }> = [];
-				const bounds = new THREE.Box3();
-				proto.traverse((o: any) => {
-					if (!o.isMesh || !o.geometry?.getAttribute?.("position")) return;
-					const rel = new THREE.Matrix4().multiplyMatrices(inv, o.matrixWorld);
-					const g = o.geometry.clone();
-					g.applyMatrix4(rel);
-					g.computeBoundingBox();
-					if (!g.boundingBox || g.boundingBox.isEmpty()) {
-						g.dispose();
-						return;
-					}
-					bounds.union(g.boundingBox);
-					let latch = false;
-					for (let n: any = o; n && n !== proto; n = n.parent) {
-						if (/latch|clasp|knob|lock/i.test(n.name ?? "")) {
-							latch = true;
-							break;
-						}
-					}
-					parts.push({ g, m: Array.isArray(o.material) ? o.material[0] : o.material, latch });
-				});
-				if (!parts.length || bounds.isEmpty()) continue;
-				const center = bounds.getCenter(new THREE.Vector3());
-				const width = bounds.max.x - bounds.min.x;
-				if (bucket.chest && !parts.some((p) => p.latch)) {
-					for (const p of parts) {
-						const b2 = p.g.boundingBox!;
-						const pw = b2.max.x - b2.min.x;
-						const pcx = (b2.min.x + b2.max.x) / 2;
-						p.latch = pw < width * 0.4 && Math.abs(pcx - center.x) < width * 0.1;
-					}
-				}
-				// CENTER convention: rendered cell c spans [c−0.5, c+0.5] (cubane geometry
-				// is already centered on the integer point) — recentre X/Z to the cell
-				// CENTER (0) and drop the floor half a block below it
-				const corr = new THREE.Vector3(-center.x, -bounds.min.y - 0.5, -center.z);
-				const st = 30 / 14;
-				const dbl = new THREE.Matrix4().set(
-					st,
-					0,
-					0,
-					0.5 * (1 - st),
-					0,
-					1,
-					0,
-					0,
-					0,
-					0,
-					1,
-					0,
-					0,
-					0,
-					0,
-					1
-				);
-				const ang = ROT_Y2[bucket.facing] ?? 0;
-				const cos = Math.cos(ang),
-					sin = Math.sin(ang);
-				const im = new THREE.Matrix4();
-				for (const part of parts) {
-					const partMaterials = Array.isArray(part.m) ? part.m : [part.m];
-					if (partMaterials.some((material: THREE.Material) => material.userData?.isWater)) {
-						part.g.dispose();
-						continue; // waterlogged entities get water from the shared fluid surface
-					}
-					part.g.translate(corr.x, corr.y, corr.z);
-					let g = part.g;
-					if (bucket.double && !part.latch) {
-						g = part.g.clone();
-						g.applyMatrix4(dbl);
-					}
-					g.computeBoundingBox();
-					g.computeBoundingSphere();
-					let mat = part.m;
-					// ANY material in the array counts (top faces often ride [1]+), and
-					// missing texturePath metadata must not leak the atlas through
-					const matsArr = Array.isArray(part.m) ? part.m : [part.m];
-					const tp =
-						matsArr.map((mm: any) => mm?.userData?.texturePath || "").join("|") +
-						"|" +
-						bucket.state;
-					const liq = /water|lava/i.exec(tp)?.[0]?.toLowerCase();
-					if (liq) {
-						// BYPASS LIQUIDS: swap the shared atlas map for a CLONED strip
-						// texture and frame-cycle it via texture offset — animated and
-						// tinted to match the record path (which animates in-shader).
-						// Scene lighting is bypassed (emissive) so brightness matches the
-						// unlit record-path liquids from every angle.
-						mat = mat.clone();
-						mat.map = null;
-						try {
-							const texPath = String(matsArr[0]?.userData?.texturePath || `block/${liq}_still`);
-							const tex = await al.getTexture(texPath);
-							const img = tex?.image;
-							const iw = img?.width ?? img?.[0]?.width;
-							const ih = img?.height ?? img?.[0]?.height;
-							const frames = iw && ih && ih > iw ? Math.max(1, Math.round(ih / iw)) : 1;
-							// geometry V spans one frame inside the atlas (atlasUV);
-							// rescale the strip so that span lands on frame 0's rows
-							const auv = matsArr[0]?.userData?.atlasUV;
-							const hSpan = auv?.height || 1 / frames;
-							const v0GL = auv ? 1 - auv.v - hSpan : 0;
-							const strip = tex.clone();
-							strip.needsUpdate = true;
-							const r = 1 / (frames * hSpan);
-							strip.repeat.set(1, r);
-							strip.offset.set(0, 1 - 1 / frames - v0GL * r);
-							mat.map = strip;
-							// raw strips are untinted grayscale masks (water) — tint to
-							// match the pack-time atlas tint; lava keeps its colors
-							mat.emissive = new THREE.Color(liq === "water" ? 0x2f58ab : 0xffffff);
-							mat.emissiveMap = strip;
-							mat.emissiveIntensity = 1.0;
-							mat.color = new THREE.Color(0x000000);
-							// depth-write like the record-path water: only the front
-							// shell blends — no alpha compounding through stacked shells
-							mat.depthWrite = true;
-							mat.needsUpdate = true;
-							if (frames > 1) {
-								const t0 = performance.now();
-								(part as any).__animStrip = () => {
-									const k = Math.floor(((performance.now() - t0) / 1000) * 5) % frames;
-									strip.offset.y = 1 - 1 / frames - v0GL * r - k / frames;
-								};
-							}
-						} catch {
-							/* keep null = flat color */
-						}
-					}
-					const inst = new THREE.InstancedMesh(g, mat, bucket.positions.length);
-					inst.frustumCulled = true;
-					// liquid strip animation (offset cycling set up above)
-					if ((part as any).__animStrip) inst.onBeforeRender = () => (part as any).__animStrip();
-					for (let i = 0; i < bucket.positions.length; i++) {
-						const p = bucket.positions[i];
-						// geometry is centered at origin after corr — rotate about the
-						// cell center and place at the integer point (CENTER convention)
-						im.set(cos, 0, sin, p.x, 0, 1, 0, p.y, -sin, 0, cos, p.z, 0, 0, 0, 1);
-						inst.setMatrixAt(i, im);
-					}
-					inst.instanceMatrix.needsUpdate = true;
-					// bounds: the baked geometry lives in unit-cell space, so any
-					// geometry-sphere fallback culls wrongly with view direction (the
-					// "look up = gone, look down = back" bug). Compute the INSTANCE
-					// sphere; if unavailable, cover the whole grid so these few meshes
-					// are never frustum-culled.
-					try {
-						(inst as any).computeBoundingSphere?.();
-						if (!(inst as any).boundingSphere) {
-							(inst as any).boundingSphere = new THREE.Sphere(
-								new THREE.Vector3(sx / 2, sy / 2, sz / 2),
-								Math.hypot(sx, sy, sz)
-							);
-						}
-					} catch {
-						(inst as any).frustumCulled = false;
-					}
-					inst.userData.gpuBuilt = false;
-					meshes.push(inst as any);
-				}
-			}
 		}
 		this.schematicRenderer.invalidate?.();
 		return { meshes, chunkMap: new Map() };
@@ -2088,9 +1782,13 @@ export class SchematicObject extends EventEmitter {
 		for (const state of new Set(states)) {
 			if (state === "minecraft:end_portal") {
 				if (!this.endPortalMaterial) {
+					const modernPortal = "entity/end_portal/end_portal";
+					const portalPath = (await loader.getResourceBlob?.(`textures/${modernPortal}.png`))
+						? modernPortal
+						: "entity/end_portal";
 					const [sky, portal] = await Promise.all([
 						loader.getTexture("environment/end_sky"),
-						loader.getTexture("entity/end_portal"),
+						loader.getTexture(portalPath),
 					]);
 					this.endPortalMaterial = makeEndPortalMaterial(sky, portal, this.surfaceClip);
 				}
@@ -2113,7 +1811,8 @@ export class SchematicObject extends EventEmitter {
 						makeGlassMaterial(
 							map,
 							isGlass(state) && !face.texture.endsWith("_top"),
-							this.surfaceClip
+							this.surfaceClip,
+							source
 						)
 					);
 			}
@@ -2188,6 +1887,7 @@ export class SchematicObject extends EventEmitter {
 		this.applyPropertiesToObjects(replacements);
 		for (const mesh of replacements) this.group.add(mesh);
 		this.meshes.push(...replacements);
+		if (await this.touchesFluid(positions)) await this.refreshFluidSurface();
 		this.animatedSurfaces = this.meshes.filter((mesh) => mesh.userData.animatedSurface);
 		this.group.updateMatrixWorld(true);
 		this.schematicRenderer.invalidate();
@@ -2201,26 +1901,61 @@ export class SchematicObject extends EventEmitter {
 		);
 	}
 
+	private async touchesFluid(positions: readonly THREE.Vector3[]): Promise<boolean> {
+		const { hasFluid } = await import("../meshing/WaterMesher");
+		if (!this.meshes.some((mesh) => mesh.userData.fluidMesh)) return false;
+		const dims = this.schematicWrapper.get_dimensions?.();
+		for (const { x, y, z } of positions)
+			for (let dy = -1; dy <= 1; dy++)
+				for (let dz = -1; dz <= 1; dz++)
+					for (let dx = -1; dx <= 1; dx++) {
+						if (
+							dims &&
+							(x + dx < 0 ||
+								y + dy < 0 ||
+								z + dz < 0 ||
+								x + dx >= dims[0] ||
+								y + dy >= dims[1] ||
+								z + dz >= dims[2])
+						)
+							continue;
+						if (hasFluid(this.schematicWrapper.get_block_string(x + dx, y + dy, z + dz) || ""))
+							return true;
+					}
+		return false;
+	}
+
+	private async refreshFluidSurface(): Promise<void> {
+		const replacements = await this.buildFluidSurface(this);
+		const materials = new Set<THREE.Material>();
+		this.meshes = this.meshes.filter((mesh) => {
+			if (!mesh.userData.fluidMesh) return true;
+			this.group.remove(mesh);
+			mesh.geometry.dispose();
+			for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material])
+				materials.add(material);
+			return false;
+		});
+		materials.forEach((material) => material.dispose());
+		this.applyPropertiesToObjects(replacements);
+		if (replacements.length) this.group.add(...replacements);
+		this.meshes.push(...replacements);
+		this.animatedSurfaces = this.meshes.filter((mesh) => mesh.userData.animatedSurface);
+		this.schematicRenderer.invalidate();
+	}
+
 	/** One shared surface pass for both the GPU-pull and batched CPU paths. */
 	private async buildFluidSurface(schematicObject: SchematicObject): Promise<THREE.Mesh[]> {
 		this.bubbleMesh = null;
 		try {
-			const { buildFluidMeshes, setFluidTextures, hasFluid } =
-				await import("../meshing/WaterMesher");
+			const { buildFluidMeshes, hasFluid } = await import("../meshing/WaterMesher");
 			const { fluidPaletteStates, createFluidStateLookup } =
 				await import("../meshing/FluidStateLookup");
 			const palette = this.getPalettes(schematicObject.schematicWrapper).default;
 			const states = fluidPaletteStates(palette);
 			if (!states.some(hasFluid)) return [];
 			const [sx, sy, sz] = schematicObject.schematicWrapper.get_dimensions();
-			try {
-				// the frame array registry is a module export, not a global — hand it
-				// to the fluid material factory explicitly
-				const { liquidFrameTextures } = await import("../meshing/RecordRenderer");
-				setFluidTextures(liquidFrameTextures);
-			} catch {
-				/* tryBind falls back lazily */
-			}
+			const textures = this.schematicRenderer.cubane.getAssetLoader().getFluidTextures();
 			const getBlock = createFluidStateLookup(
 				schematicObject.schematicWrapper,
 				states,
@@ -2232,7 +1967,7 @@ export class SchematicObject extends EventEmitter {
 					hiddenCells: this.hiddenCells,
 				}
 			);
-			const fluid = buildFluidMeshes(getBlock, sx, sy, sz);
+			const fluid = buildFluidMeshes(getBlock, sx, sy, sz, textures);
 			for (const fm of fluid.meshes) {
 				fm.userData.fluidMesh = true;
 			}
@@ -2242,7 +1977,10 @@ export class SchematicObject extends EventEmitter {
 					.getAssetLoader()
 					.getTexture("particle/bubble");
 				this.bubbleMesh = buildBubbleMesh(fluid.bubbleCells, texture);
-				if (this.bubbleMesh) fluid.meshes.push(this.bubbleMesh);
+				if (this.bubbleMesh) {
+					this.bubbleMesh.userData.fluidMesh = true;
+					fluid.meshes.push(this.bubbleMesh);
+				}
 			}
 			console.log(
 				`[FluidMesh] ${fluid.cells.toLocaleString()} fluid cells → ${fluid.meshes.length} meshes in ${fluid.ms.toFixed(0)}ms`
@@ -2275,39 +2013,17 @@ export class SchematicObject extends EventEmitter {
 			sz = dimsArr[2];
 		const palettes = this.getPalettes(schematic);
 		await this.worldMeshBuilder.precomputePaletteGeometries(palettes.default, fluidSurface);
-		const airIdx = new Set<number>();
-		(palettes.default || []).forEach((e: any, i: number) => {
-			if (e?.name === "minecraft:air" || e?.Name === "minecraft:air") airIdx.add(i);
+		const { grid, indexOffset } = extractVisibleGrid(schematic, palettes.default, sx, sy, sz, {
+			bounds: schematicObject.renderingBounds,
+			hiddenCells: this.hiddenCells,
 		});
-		if (airIdx.size === 0) airIdx.add(0);
-		const iterator = schematic.create_lazy_chunk_iterator(16, 16, 16, "bottom_up", 0, 0, 0);
-		const grid = new Uint32Array(sx * sy * sz);
-		let written = 0;
-		while (iterator.has_next()) {
-			const cd = iterator.next();
-			if (!cd || !cd.blocks) continue;
-			if (cd.blocks instanceof Int32Array || cd.blocks instanceof Uint32Array) {
-				const b = cd.blocks;
-				for (let i = 0; i + 3 < b.length; i += 4) {
-					if (airIdx.has(b[i + 3])) continue;
-					grid[(b[i + 1] * sz + b[i + 2]) * sx + b[i]] = b[i + 3];
-					written++;
-				}
-			} else {
-				for (const b of cd.blocks) {
-					if (airIdx.has(b[3])) continue;
-					grid[(b[1] * sz + b[2]) * sx + b[0]] = b[3];
-					written++;
-				}
-			}
-		}
-		this.applyHiddenCells(grid, sx, sy, sz);
 		this.gpuBuilt = true;
-		console.log(
-			`[GpuBuild] grid ${written.toLocaleString()} non-air blocks; dims=${dimsArr.join(",")}`
-		);
 		const wmb: any = this.worldMeshBuilder;
-		const paletteData = wmb.paletteCache?.paletteGeometryData;
+		const rawPaletteData = wmb.paletteCache?.paletteGeometryData;
+		const paletteData =
+			indexOffset && rawPaletteData
+				? rawPaletteData.map((p: any) => ({ ...p, index: p.index + indexOffset }))
+				: rawPaletteData;
 		if (!paletteData || !Array.isArray(paletteData)) {
 			throw new Error("[GpuBuild] paletteGeometryData unavailable (stale cache path)");
 		}
@@ -2325,8 +2041,9 @@ export class SchematicObject extends EventEmitter {
 			/minecraft:(trapped_chest|ender_chest|chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_chest|(?:waxed_)?(?:(?:exposed|weathered|oxidized)_)?copper_golem_statue|firefly_bush|(?:potted_)?open_eyeblossom|redstone_wire|kelp|kelp_plant|seagrass|tall_seagrass)(\[|\s|$)/;
 		const entityPalette = new Set<number>();
 		(palettes.default || []).forEach((e: any, i: number) => {
-			if (ENTITY_FAMILY.test(e?.name || e?.Name || "")) entityPalette.add(i);
+			if (ENTITY_FAMILY.test(e?.name || e?.Name || "")) entityPalette.add(i + indexOffset);
 		});
+		const fullStates = fluidPaletteStates(palettes.default);
 		let entityCells: Array<{ x: number; y: number; z: number; block: string }> = [];
 		if (entityPalette.size > 0) {
 			for (let y = 0; y < sy; y++)
@@ -2338,36 +2055,9 @@ export class SchematicObject extends EventEmitter {
 						// FULL blockstate (astra): facing/connectivity/power select different
 						// models & rotations — the bare name renders wrong shapes and no facing.
 						// get_block returns name-only; get_block_with_properties carries state.
-						let full = schematic.get_block?.(x, y, z) || (palettes.default as any)[p]?.name || "";
-						try {
-							const bp = schematic.get_block_with_properties?.(x, y, z);
-							const props = bp?.properties?.() ?? bp?.properties;
-							if (props && Object.keys(props).length) {
-								full = `${full.split("[")[0]}[${Object.keys(props)
-									.sort()
-									.map((k) => `${k}=${props[k]}`)
-									.join(",")}]`;
-							}
-						} catch {
-							/* state optional */
-						}
+						const full = fullStates[p - indexOffset] || schematic.get_block_string?.(x, y, z) || "";
 						entityCells.push({ x, y, z, block: full });
 						grid[gi] = 0;
-					}
-		}
-		// PURE FLUIDS leave the record grid too — they render as real sloped
-		// geometry via WaterMesher (vanilla corner-height surface), not records
-		const FLUID = /minecraft:(water|lava|bubble_column)(\[|\s|$)/;
-		const fluidPalette = new Set<number>();
-		(palettes.default || []).forEach((e: any, i: number) => {
-			if (FLUID.test(e?.name || e?.Name || "")) fluidPalette.add(i);
-		});
-		if (fluidPalette.size > 0) {
-			for (let y2 = 0; y2 < sy; y2++)
-				for (let z2 = 0; z2 < sz; z2++)
-					for (let x2 = 0; x2 < sx; x2++) {
-						const gi2 = (y2 * sz + z2) * sx + x2;
-						if (grid[gi2] !== 0 && fluidPalette.has(grid[gi2])) grid[gi2] = 0;
 					}
 		}
 		return { builder, paletteData, materials, grid, sx, sy, sz, entityCells };
@@ -2453,6 +2143,21 @@ export class SchematicObject extends EventEmitter {
 				}
 			}
 
+			if (this.hiddenCells.size) {
+				const filtered: number[] = [];
+				for (let i = 0; i + 3 < blocksArray.length; i += 4)
+					if (
+						!this.hiddenCells.has(`${blocksArray[i]},${blocksArray[i + 1]},${blocksArray[i + 2]}`)
+					)
+						filtered.push(
+							blocksArray[i],
+							blocksArray[i + 1],
+							blocksArray[i + 2],
+							blocksArray[i + 3]
+						);
+				if (!filtered.length) continue;
+				if (filtered.length !== blocksArray.length) blocksArray = Int32Array.from(filtered);
+			}
 			allChunks.push({
 				blocks: blocksArray,
 				chunk_x: chunkData.chunk_x,
@@ -2656,6 +2361,7 @@ export class SchematicObject extends EventEmitter {
 		// Update the rendering bounds
 		this.renderingBounds.min = min.clone();
 		this.renderingBounds.max = max.clone();
+		this.renderingBounds.enabled = true;
 
 		// Create/update the visualizer if requested
 		this.createRenderingBoundsHelper(showHelper);
@@ -2697,6 +2403,7 @@ export class SchematicObject extends EventEmitter {
 
 	public async getMeshes(): Promise<THREE.Object3D[]> {
 		await this.meshesReady;
+		await this.editQueue;
 		return Array.from(this.group.children);
 	}
 
@@ -2731,31 +2438,32 @@ export class SchematicObject extends EventEmitter {
 
 	// Optimized material update method
 	private updateMeshMaterials(property: "opacity") {
-		const needsTransparency = this.opacity < 1.0;
-
+		this.materialStates ??= new WeakMap();
 		this.group.traverse((child) => {
-			if (child instanceof THREE.Mesh) {
-				const materials = Array.isArray(child.material) ? child.material : [child.material];
-
-				materials.forEach((mat) => {
-					if (mat) {
-						mat.opacity = this.opacity;
-						if (mat instanceof THREE.ShaderMaterial && mat.userData.fluidAlpha !== undefined) {
-							mat.uniforms.uAlpha.value = mat.userData.fluidAlpha * this.opacity;
-							mat.transparent = needsTransparency || mat.userData.kind === "water";
-						} else {
-							mat.transparent = needsTransparency || !!mat.userData.surfaceTransparent;
-						}
-					}
-				});
-			}
+			if (!(child instanceof THREE.Mesh)) return;
+			// Some direct callers create meshes before applyProperties; isolate registry
+			// materials here too, without changing visibility or helper state.
+			this.applyPropertiesToObjects([child]);
 		});
-		// Emit event if necessary
+		this.group.visible = this.visible && this.opacity > 0;
 		this.emitPropertyChanged("material", { property, value: this.opacity });
 	}
 
 	private updateMeshVisibility() {
-		this.group.visible = this.visible;
+		this.group.visible = this.visible && this.opacity > 0;
+		if (
+			this.visible &&
+			this.hasBuiltMeshes === false &&
+			!this.visibilityBuildPending &&
+			!this.disposed
+		) {
+			this.visibilityBuildPending = true;
+			void this.rebuildMesh()
+				.catch((error) => console.error("Failed to show schematic", error))
+				.finally(() => {
+					this.visibilityBuildPending = false;
+				});
+		}
 		// Emit event if necessary
 		this.emitPropertyChanged("visibility", this.visible);
 	}
@@ -2765,23 +2473,63 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private async updateMeshNow() {
-		this.disposeSurfaceResources();
-		// Remove old meshes from the scene
-		this.meshes.forEach((mesh) => {
-			this.group.remove(mesh);
-			mesh.geometry.dispose();
-			if (Array.isArray(mesh.material)) {
-				mesh.material.forEach((material) => material.dispose());
-			} else {
-				mesh.material.dispose();
-			}
-		});
+		this.clearBuiltMeshes();
+		if (this.visible && !this.disposed) await this.buildMeshes();
+		this.schematicRenderer.invalidate?.();
+	}
 
-		// Clear chunk meshes
-		this.chunkMeshes.clear();
-		if (this.visible) {
-			await this.buildMeshes();
+	/** Release meshes and GPU-owned tables, including detached progressive batches. */
+	private clearBuiltMeshes(): void {
+		const roots = new Set<THREE.Object3D>([...this.meshes, ...this.group.children]);
+		for (const objects of this.chunkMeshes?.values() ?? [])
+			for (const object of objects) roots.add(object);
+		const cached = new Set<THREE.Material>(this.surfaceMaterials?.values() ?? []);
+		if (this.endPortalMaterial) cached.add(this.endPortalMaterial);
+		const geometry = new Set<THREE.BufferGeometry>();
+		const materials = new Set<THREE.Material>();
+		for (const material of this.ownedMaterialCopies ?? []) materials.add(material);
+		for (const root of roots) {
+			if (root.name.startsWith("region_")) continue;
+			root.traverse((child) => {
+				if (!(child instanceof THREE.Mesh)) return;
+				if (typeof child.userData.releaseRecordResources === "function") return;
+				if (child.geometry) geometry.add(child.geometry);
+				for (const material of Array.isArray(child.material) ? child.material : [child.material])
+					if (
+						material &&
+						!cached.has(material) &&
+						!material.userData.surfaceCacheOwned &&
+						!material.userData.registryShared
+					)
+						materials.add(material);
+				if (child instanceof THREE.InstancedMesh) child.dispose();
+			});
+			disposeRecordMeshes([root]);
+			this.group.remove(root);
 		}
+		geometry.forEach((g) => g.dispose());
+		materials.forEach((m) => m.dispose());
+		this.disposeSurfaceResources();
+		this.materialCopies = new WeakMap();
+		this.ownedMaterialCopies = new Set();
+		this.materialStates = new WeakMap();
+		this.chunkMeshes?.clear();
+		this.meshes = [];
+		this.bubbleMesh = null;
+		this.hasBuiltMeshes = false;
+	}
+
+	/** Stop future staging/edit work immediately, then release the settled build. */
+	public async dispose(): Promise<void> {
+		if (this.disposed) return;
+		this.disposed = true;
+		if (this._propertyWatcherTimer !== null) clearTimeout(this._propertyWatcherTimer);
+		this._propertyWatcherTimer = null;
+		this.group.removeFromParent();
+		await Promise.allSettled([this.meshesReady, this.editQueue]);
+		this.clearBuiltMeshes();
+		this._gpuMeshBuilder?.dispose?.();
+		this._gpuMeshBuilder = null;
 	}
 
 	public async rebuildMesh(): Promise<void> {
@@ -2789,7 +2537,6 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private async rebuildMeshNow() {
-		this.disposeSurfaceResources();
 		performanceMonitor.startOperation(`rebuildMesh-${this.name}`);
 
 		// Show progress bar if enabled in renderer options
@@ -2799,52 +2546,7 @@ export class SchematicObject extends EventEmitter {
 			renderer.uiManager.updateProgress(0.1, "Disposing old meshes...");
 		}
 
-		// Remove old meshes from the scene. GPU record meshes are NOT disposed: their
-		// ShaderMaterials share compiled-program state and template tables with the
-		// renderer session, and disposing them corrupted the NEXT build's draw state
-		// (second load rendered black with the program never compiling). They are
-		// small (records textures) and GC'd with the object graph.
-		this.meshes.forEach((mesh) => {
-			this.group.remove(mesh as THREE.Object3D);
-			if ((mesh as any).userData?.gpuBuilt) return;
-			mesh.geometry?.dispose();
-			if (Array.isArray(mesh.material)) {
-				mesh.material.forEach((material) => material?.dispose());
-			} else {
-				mesh.material?.dispose();
-			}
-		});
-
-		// Also clear ALL children from the group, EXCEPT regions
-		// Create a copy of children to iterate over safely
-		const children = [...this.group.children];
-		let removedCount = 0;
-
-		for (const child of children) {
-			// Skip regions - regions are parented to the schematic group and have names starting with "region_"
-			// We check 'name' because 'id' is an internal three.js integer
-			if (child.name && child.name.startsWith("region_")) {
-				continue;
-			}
-
-			this.group.remove(child);
-			removedCount++;
-			if (child instanceof THREE.Mesh && !(child as any).userData?.gpuBuilt) {
-				// gpuBuilt materials share compiled programs via three's program cache;
-				// disposing one destroys the program out from under the NEXT build's
-				// identical material (renders nothing, program never recompiles)
-				child.geometry?.dispose();
-				if (Array.isArray(child.material)) {
-					child.material.forEach((m) => m?.dispose());
-				} else {
-					child.material?.dispose();
-				}
-			}
-		}
-
-		// Clear chunk meshes and update progress
-		this.chunkMeshes.clear();
-		this.meshes = [];
+		this.clearBuiltMeshes();
 
 		if (renderer?.options.enableProgressBar && renderer.uiManager) {
 			renderer.uiManager.updateProgress(0.2, "Building new meshes...");
@@ -2861,6 +2563,7 @@ export class SchematicObject extends EventEmitter {
 		}
 
 		performanceMonitor.endOperation(`rebuildMesh-${this.name}`);
+		this.schematicRenderer.invalidate?.();
 	}
 
 	public getSchematicWrapper(): SchematicWrapper {
@@ -3319,6 +3022,7 @@ export class SchematicObject extends EventEmitter {
 				// Wait for the initial build to settle without blocking recovery operations.
 				// Its original promise still reports the failure to initial-build callers.
 			}
+			if (this.disposed) throw new Error("Schematic has been disposed");
 			return operation();
 		});
 		this.editQueue = run.then(
@@ -3337,16 +3041,19 @@ export class SchematicObject extends EventEmitter {
 		const updates = blocks.map(
 			([point, state]) =>
 				[
-					Array.isArray(point)
+					(Array.isArray(point)
 						? new THREE.Vector3(...(point as [number, number, number]))
-						: point.clone(),
+						: point.clone()
+					).roundToZero(),
 					state,
 				] as const
 		);
 		// Serialize edits so async texture preparation cannot apply an older edit last.
 		return this.enqueueEdit(async () => {
 			let surfacesChanged = false,
-				surfaceOnly = true;
+				surfaceOnly = true,
+				fluidChanged = false;
+			const { hasFluid } = await import("../meshing/WaterMesher");
 			const positions: THREE.Vector3[] = [];
 			for (const [point, blockType] of updates) {
 				const position = point;
@@ -3354,6 +3061,7 @@ export class SchematicObject extends EventEmitter {
 					this.schematicWrapper.get_block_string(position.x, position.y, position.z) || "";
 				surfacesChanged ||= isSurfaceBlock(old) || isSurfaceBlock(blockType);
 				surfaceOnly &&= this.isSurfaceOnlyState(old) && this.isSurfaceOnlyState(blockType);
+				fluidChanged ||= hasFluid(old) || hasFluid(blockType);
 				await this.setBlockNoRebuild(position, blockType);
 				positions.push(position);
 			}
@@ -3364,20 +3072,40 @@ export class SchematicObject extends EventEmitter {
 			// Opaque or waterlogged transitions also change the main mesher's geometry.
 			// Global batches cannot be replaced with a single incremental chunk safely.
 			const mode = this.schematicRenderer.options.meshBuildingMode || "incremental";
-			if (surfacesChanged || !["immediate", "incremental"].includes(mode)) {
+			if (surfacesChanged || fluidChanged || !["immediate", "incremental"].includes(mode)) {
 				await this.rebuildMeshNow();
 				return;
 			}
-			const chunks = new Set(
-				positions.map((p) => {
-					const c = this.getChunkCoordinates(p);
-					return `${c.x},${c.y},${c.z}`;
-				})
-			);
-			for (const key of chunks) {
-				const [x, y, z] = key.split(",").map(Number);
-				await this.rebuildChunk(x, y, z);
-			}
+			await this.withBuilder(async () => {
+				await this.worldMeshBuilder.precomputePaletteGeometries(
+					this.getPalettes(this.schematicWrapper).default,
+					true
+				);
+				const { chunkWidth, chunkHeight, chunkLength } = this.chunkDimensions;
+				const chunks = new Map<string, [number, number, number]>();
+				const addChunk = (x: number, y: number, z: number) => {
+					const key = `${x},${y},${z}`;
+					if (!chunks.has(key)) chunks.set(key, [x, y, z]);
+				};
+				for (const position of positions) {
+					const { x, y, z } = this.getChunkCoordinates(position);
+					addChunk(x, y, z);
+					const localX = position.x - x * chunkWidth;
+					const localY = position.y - y * chunkHeight;
+					const localZ = position.z - z * chunkLength;
+					// A seam edit can expose or hide the face in the adjacent chunk.
+					if (localX === 0) addChunk(x - 1, y, z);
+					if (localX === chunkWidth - 1) addChunk(x + 1, y, z);
+					if (localY === 0) addChunk(x, y - 1, z);
+					if (localY === chunkHeight - 1) addChunk(x, y + 1, z);
+					if (localZ === 0) addChunk(x, y, z - 1);
+					if (localZ === chunkLength - 1) addChunk(x, y, z + 1);
+				}
+				for (const chunk of chunks.values()) {
+					await this.rebuildChunkNow(...chunk);
+				}
+			});
+			if (await this.touchesFluid(positions)) await this.refreshFluidSurface();
 			this.schematicRenderer.invalidate();
 		});
 	}
@@ -3452,19 +3180,11 @@ export class SchematicObject extends EventEmitter {
 	/** Schematic-space cells hidden via the inspector ("x,y,z"); applied on GPU rebuilds */
 	public hiddenCells = new Set<string>();
 
-	private applyHiddenCells(grid: Uint32Array, sx: number, sy: number, sz: number): void {
-		if (this.hiddenCells.size === 0) return;
-		for (const key of this.hiddenCells) {
-			const [x, y, z] = key.split(",").map(Number);
-			if (x >= 0 && y >= 0 && z >= 0 && x < sx && y < sy && z < sz) grid[(y * sz + z) * sx + x] = 0;
-		}
-	}
-
 	/** Surface-only inspector edits replace their affected sections in every build mode. */
 	public async hideBlockAndRebuild(x: number, y: number, z: number): Promise<boolean> {
 		return this.enqueueEdit(async () => {
 			const state = this.schematicWrapper.get_block_string(x, y, z) || "";
-			if (!this.gpuBuilt && !isSurfaceBlock(state)) return false;
+			if (!state || /^(?:minecraft:)?(?:air|cave_air|void_air)$/.test(state)) return false;
 			this.hiddenCells.add(`${x},${y},${z}`);
 			if (isSurfaceBlock(state) && this.isSurfaceOnlyState(state)) {
 				await this.refreshSurfaceCells([new THREE.Vector3(x, y, z)]);
@@ -3604,6 +3324,46 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	public async rebuildChunk(chunkX: number, chunkY: number, chunkZ: number) {
+		return this.enqueueEdit(async () => {
+			const mode = this.schematicRenderer.options.meshBuildingMode || "incremental";
+			if (!["incremental", "immediate"].includes(mode)) return this.rebuildMeshNow();
+			await this.withBuilder(async () => {
+				await this.worldMeshBuilder.precomputePaletteGeometries(
+					this.getPalettes(this.schematicWrapper).default,
+					true
+				);
+				await this.rebuildChunkNow(chunkX, chunkY, chunkZ);
+			});
+			this.schematicRenderer.invalidate();
+		});
+	}
+
+	private readChunkApron(x: number, y: number, z: number): Int32Array | undefined {
+		const { chunkWidth: width, chunkHeight: height, chunkLength: length } = this.chunkDimensions;
+		const wrapper = this.schematicWrapper;
+		// Read just the six one-block-thick faces. Edges and corners cannot occlude a face.
+		const planes = [
+			wrapper.get_chunk_blocks_indices(x - 1, y, z, 1, height, length),
+			wrapper.get_chunk_blocks_indices(x + width, y, z, 1, height, length),
+			wrapper.get_chunk_blocks_indices(x, y - 1, z, width, 1, length),
+			wrapper.get_chunk_blocks_indices(x, y + height, z, width, 1, length),
+			wrapper.get_chunk_blocks_indices(x, y, z - 1, width, height, 1),
+			wrapper.get_chunk_blocks_indices(x, y, z + length, width, height, 1),
+		];
+		const blockCount = planes.reduce((count, plane) => count + plane.length, 0);
+		if (!blockCount) return;
+		const apron = new Int32Array(blockCount * 4);
+		let offset = 0;
+		for (const plane of planes) {
+			for (const block of plane) {
+				apron.set(block, offset);
+				offset += 4;
+			}
+		}
+		return apron;
+	}
+
+	private async rebuildChunkNow(chunkX: number, chunkY: number, chunkZ: number) {
 		const chunkOffset = {
 			x: chunkX * this.chunkDimensions.chunkWidth,
 			y: chunkY * this.chunkDimensions.chunkHeight,
@@ -3611,7 +3371,7 @@ export class SchematicObject extends EventEmitter {
 		};
 
 		// Check if chunk is outside rendering bounds - if so, just remove it
-		if (this.renderingBounds) {
+		if (this.renderingBounds?.enabled) {
 			const chunkMaxX = chunkOffset.x + this.chunkDimensions.chunkWidth;
 			const chunkMaxY = chunkOffset.y + this.chunkDimensions.chunkHeight;
 			const chunkMaxZ = chunkOffset.z + this.chunkDimensions.chunkLength;
@@ -3660,9 +3420,10 @@ export class SchematicObject extends EventEmitter {
 			);
 		}
 
-		// Remove old chunk objects from the scene
-		this.removeChunkObjects(chunkX, chunkY, chunkZ);
-
+		if (!blocks.length) {
+			this.removeChunkObjects(chunkX, chunkY, chunkZ);
+			return;
+		}
 		// Build new chunk objects using the optimized format
 		const newChunkObjects = await this.worldMeshBuilder.getChunkMesh(
 			{
@@ -3670,6 +3431,7 @@ export class SchematicObject extends EventEmitter {
 				chunk_x: chunkX,
 				chunk_y: chunkY,
 				chunk_z: chunkZ,
+				apronBlocks: this.readChunkApron(chunkOffset.x, chunkOffset.y, chunkOffset.z),
 			},
 			this,
 			this.renderingBounds,
@@ -3678,6 +3440,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Apply properties to the new objects
 		this.applyPropertiesToObjects(newChunkObjects);
+		this.removeChunkObjects(chunkX, chunkY, chunkZ);
 
 		newChunkObjects.forEach((obj) => {
 			this.group.add(obj);
@@ -3685,11 +3448,14 @@ export class SchematicObject extends EventEmitter {
 
 		// Update the chunk object reference in chunkMeshes map
 		this.setChunkObjectsAt(chunkX, chunkY, chunkZ, newChunkObjects);
+		this.meshes.push(...(newChunkObjects as THREE.Mesh[]));
 	}
 
 	private removeChunkObjects(chunkX: number, chunkY: number, chunkZ: number) {
 		const oldChunkObjects = this.getChunkObjectsAt(chunkX, chunkY, chunkZ);
 		if (oldChunkObjects) {
+			const old = new Set(oldChunkObjects);
+			this.meshes = this.meshes.filter((mesh) => !old.has(mesh));
 			oldChunkObjects.forEach((obj) => {
 				this.group.remove(obj);
 				// Dispose of geometries and materials within the object
@@ -3697,9 +3463,16 @@ export class SchematicObject extends EventEmitter {
 					if (child instanceof THREE.Mesh && !(child as any).userData?.gpuBuilt) {
 						child.geometry?.dispose();
 						if (Array.isArray(child.material)) {
-							child.material.forEach((material) => material.dispose());
+							child.material.forEach((material) => {
+								if (!material.userData.registryShared && !material.userData.schematicOwned)
+									material.dispose();
+							});
 						} else {
-							child.material?.dispose();
+							if (
+								!child.material?.userData.registryShared &&
+								!child.material?.userData.schematicOwned
+							)
+								child.material?.dispose();
 						}
 					}
 				});

@@ -8,16 +8,31 @@ export interface RecordTables {
     verts: number;
 }
 export interface RecordStream {
-    perCategory: {
-        category: string;
-        records: Uint32Array;
-        tris: number;
-    }[];
+    perCategory: RecordMaterialRun[];
     tables: RecordTables;
     sx: number;
     sy: number;
     sz: number;
 }
+/** A material-contiguous record run. The actual material, not the block's summary
+ * category, determines the render pass. Multiple states sharing the atlas/material
+ * remain batched together. */
+export interface RecordMaterialRun {
+    category: string;
+    records: Uint32Array;
+    tris: number;
+    material?: THREE.Material;
+    y0?: number;
+    h?: number;
+}
+/** Expand compute-selected triangles into conventional Three geometry on adapters
+ * that cannot bind all of the direct vertex-output storage buffers at once. */
+export declare function materializeRecordMeshes(stream: RecordStream): THREE.Mesh[];
+export declare function recordMaterialCategory(material: THREE.Material, fluid?: string): string;
+/** The compute pass writes material-contiguous records. Reuse their backing
+ * buffer as zero-copy views so the normal shared-atlas/material fast path does
+ * not add geometry copies or per-triangle classification work. */
+export declare function splitRecordMaterialRuns(records: Uint32Array, counts: readonly number[], materials: readonly THREE.Material[], category: string, y0?: number, h?: number): RecordMaterialRun[];
 export interface SectionRange {
     base: number;
     count: number;
@@ -33,18 +48,11 @@ export declare function sectionize(records: Uint32Array, items: number, sx: numb
     rec: Uint32Array;
     sections: SectionRange[];
 };
+/** Each independently culled section starts on a page boundary. */
+export declare function sectionPageCount(sections: readonly SectionRange[]): number;
 /** Fresh material per mesh (uniforms carry per-mesh textures; the compiled program is
- *  shared automatically by three's program cache). */
-/** Liquid animation frames as array-texture layers, registered by AssetLoader at
- * atlas build (fable design: hardware RepeatWrapping per layer — no atlas bleed). */
-export declare const liquidFrameTextures: {
-    water: THREE.DataArrayTexture | null;
-    waterFlow: THREE.DataArrayTexture | null;
-    lava: THREE.DataArrayTexture | null;
-    lavaFlow: THREE.DataArrayTexture | null;
-    waterOverlay: THREE.DataArrayTexture | null;
-};
-export declare function makePullMaterial(transparent: boolean, quad?: boolean): THREE.ShaderMaterial;
+ * shared automatically by three's program cache). */
+export declare function makePullMaterial(source: boolean | THREE.Material, quad?: boolean, fallbackMap?: THREE.Texture | null): THREE.ShaderMaterial;
 /** Build the pulling meshes from a record stream. One mesh per category; each mesh gets
  *  its OWN material instance (uniforms carry per-mesh textures; three still shares the
  *  compiled program across identical ShaderMaterials). drawRange drives the draws;
@@ -60,10 +68,12 @@ export declare function quadify(records: Uint32Array, tris: number, isQuadPair: 
     triTris: number;
 };
 export declare function makeQuadIndexBuffer(maxQuads: number): THREE.BufferAttribute;
-export declare function makeRecordMeshes(stream: RecordStream, atlas: THREE.Texture, isQuadPair?: (rowA: number, rowB: number) => {
+export declare function makeRecordMeshes(stream: RecordStream, atlas: THREE.Texture | null, isQuadPair?: (rowA: number, rowB: number) => {
     quad: boolean;
     corners: [number, number, number, number] | null;
 }): THREE.Mesh[];
+/** Release only the generated record resources; asset maps remain asset-loader owned. */
+export declare function disposeRecordMeshes(meshes: Iterable<THREE.Object3D>): void;
 export declare function buildRecordTables(tplPos: number[], tplNrm: number[], tplUv: number[], tplIdx: number[], desc: number[], // flat [vertStart, idxStart, triStart, occ] per state (stride 4)
 desc2: number[], // flat [vertCount, idxCount, category, slotBase] per state (stride 4)
 states: number, // maxIdx

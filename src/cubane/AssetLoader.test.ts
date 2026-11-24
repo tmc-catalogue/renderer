@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { AssetLoader } from "./AssetLoader";
 import JSZip from "jszip";
 import type { ResourcePackManager } from "./ResourcePackManager";
+import * as THREE from "three";
+import { ModelResolver } from "./ModelResolver";
 
 function colormap(red: number): ImageData {
 	return { width: 1, height: 1, data: new Uint8ClampedArray([red, 0, 0, 255]) } as ImageData;
@@ -83,5 +85,86 @@ describe("renamed chain blockstates", () => {
 		const read = vi.spyOn(loader, "getResourceString").mockResolvedValue('{"variants":{}}');
 		await loader.getBlockState("iron_chain");
 		expect(read).toHaveBeenCalledExactlyOnceWith("blockstates/iron_chain.json");
+	});
+});
+
+describe("render material classifications", () => {
+	it.each([
+		[[255, 255], false, 0, true],
+		[[255, 0], false, 0.5, true],
+		[[255, 128], true, 0.01, false],
+	] as const)(
+		"classifies RGBA alpha %j before meshing",
+		async (alphas, transparent, alphaTest, depthWrite) => {
+			const loader = new AssetLoader(false);
+			const texture = new THREE.DataTexture(
+				new Uint8Array(alphas.flatMap((alpha) => [30, 40, 50, alpha])),
+				2,
+				1
+			);
+			vi.spyOn(loader, "getTexture").mockResolvedValue(texture);
+			const material = await loader.getMaterial("block/custom_alpha", { useAtlas: false });
+			expect(material).toMatchObject({ transparent, alphaTest, depthWrite });
+			loader.dispose();
+			texture.dispose();
+		}
+	);
+	it("keeps ordinary animated sprites independent of the static atlas", async () => {
+		const loader = new AssetLoader(false);
+		const atlas = new THREE.Texture();
+		(loader as any).textureAtlas = atlas;
+		(loader as any).textureUVMap.set("block/magma", { u: 0, v: 0, width: 0.25, height: 0.75 });
+		const sprite = new THREE.DataTexture(new Uint8Array([123, 45, 67, 255]), 1, 1);
+		const animations = (loader as any).animatedTextureManager;
+		vi.spyOn(animations, "isAnimated").mockResolvedValue(true);
+		vi.spyOn(animations, "createAnimatedTexture").mockResolvedValue(sprite);
+		const material = (await loader.getMaterial("block/magma")) as THREE.MeshStandardMaterial;
+		expect(material.map).toBe(sprite);
+		expect(material.userData.atlasUV).toBeUndefined();
+		expect(material.transparent).toBe(false);
+		loader.dispose();
+		sprite.dispose();
+	});
+});
+
+describe("namespaced resource-pack models", () => {
+	it("uses the custom namespace without aliasing a same-named vanilla model or texture", async () => {
+		const loader = new AssetLoader(false);
+		const zip = new JSZip()
+			.file(
+				"assets/custom/blockstates/obsidian.json",
+				JSON.stringify({ variants: { "": { model: "custom:block/obsidian" } } })
+			)
+			.file(
+				"assets/custom/models/block/obsidian.json",
+				JSON.stringify({ textures: { all: "custom:block/obsidian" } })
+			)
+			.file("assets/custom/textures/block/obsidian.png", "custom")
+			.file("assets/minecraft/textures/block/obsidian.png", "vanilla");
+		await loader.loadResourcePack(new Blob([await zip.generateAsync({ type: "arraybuffer" })]));
+		const models = await new ModelResolver(loader).resolveBlockModel({
+			namespace: "custom",
+			name: "obsidian",
+			properties: {},
+		});
+		expect(models[0].model).toBe("custom:block/obsidian");
+		const model = await loader.getModel(models[0].model);
+		const path = loader.resolveTexture("#all", model);
+		expect(await (await loader.getResourceBlob(`textures/${path}.png`))!.text()).toBe("custom");
+		expect(await (await loader.getResourceBlob("textures/block/obsidian.png"))!.text()).toBe(
+			"vanilla"
+		);
+		expect(await loader.listBlockstates()).toEqual(["custom:obsidian"]);
+		loader.dispose();
+	});
+	it("does not synthesize liquid cubes for water/lava named model textures", async () => {
+		const loader = new AssetLoader(false);
+		vi.spyOn(loader, "getResourceString").mockResolvedValue(
+			JSON.stringify({ textures: { all: "block/cauldron" } })
+		);
+		expect(await loader.getModel("block/water_cauldron")).toEqual({
+			textures: { all: "block/cauldron" },
+		});
+		loader.dispose();
 	});
 });

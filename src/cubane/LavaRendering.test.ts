@@ -4,8 +4,7 @@ import JSZip from "jszip";
 import { AssetLoader } from "./AssetLoader";
 import { AtlasBuilder } from "./AtlasBuilder";
 import { InstancedBlockRenderer } from "../InstancedBlockRenderer";
-import { liquidFrameTextures } from "../meshing/RecordRenderer";
-import { createFluidMaterial, setFluidTextures, updateFluidTime } from "../meshing/WaterMesher";
+import { createFluidMaterial, updateFluidTime } from "../meshing/WaterMesher";
 import { fluidAnimationFrame } from "../meshing/FluidAnimation";
 import type { ResourcePackManager } from "./ResourcePackManager";
 
@@ -24,11 +23,6 @@ function mockAtlasRebuild(loader: AssetLoader): void {
 afterEach(() => {
 	vi.restoreAllMocks();
 	vi.unstubAllGlobals();
-	for (const key of ["water", "waterFlow", "waterOverlay", "lava", "lavaFlow"] as const) {
-		liquidFrameTextures[key]?.dispose();
-		liquidFrameTextures[key] = null;
-	}
-	setFluidTextures(null);
 });
 
 describe("lava rendering", () => {
@@ -58,12 +52,11 @@ describe("lava rendering", () => {
 				getImageData: () => ({ data: pixels }),
 			} as any);
 			expect(await loader.buildTextureAtlas()).toBe(atlas);
-			const texture = liquidFrameTextures.lava!;
+			const texture = loader.getFluidTextures().lava!;
 			expect(texture.image.depth).toBe(frames);
 			expect([...texture.image.data!]).toEqual([...pixels]);
 			expect(close).toHaveBeenCalledOnce();
-			setFluidTextures(liquidFrameTextures);
-			const material = createFluidMaterial("lava");
+			const material = createFluidMaterial("lava", false, loader.getFluidTextures());
 			expect(material.uniforms.uHasTex.value).toBe(1);
 			expect(material.uniforms.uTex.value).toBe(texture);
 			updateFluidTime(0.125);
@@ -72,7 +65,7 @@ describe("lava rendering", () => {
 			expect(material.depthWrite).toBe(true);
 			await loader.buildTextureAtlas();
 			updateFluidTime(0.5);
-			expect(material.uniforms.uTex.value).toBe(liquidFrameTextures.lava);
+			expect(material.uniforms.uTex.value).toBe(loader.getFluidTextures().lava);
 			expect(material.uniforms.uTex.value).toBe(texture);
 			expect(createImageBitmap).toHaveBeenCalledOnce();
 			// A subsequent pack without lava must not retain the previous texture.
@@ -80,12 +73,12 @@ describe("lava rendering", () => {
 			const zip = new JSZip().file("pack.mcmeta", "{}");
 			await loader.loadResourcePack(new Blob([await zip.generateAsync({ type: "arraybuffer" })]));
 			await loader.buildTextureAtlas();
-			expect(liquidFrameTextures.lava).toBeNull();
+			expect(loader.getFluidTextures().lava).toBeNull();
 			updateFluidTime(0.75);
 			expect(material.uniforms.uHasTex.value).toBe(0);
 			expect(material.uniforms.uTex.value).toBeNull();
 			material.dispose();
-			atlas.dispose();
+			loader.dispose();
 		}
 	);
 
@@ -116,14 +109,14 @@ describe("lava rendering", () => {
 		]);
 		expect(createImageBitmap).toHaveBeenCalledTimes(5);
 		expect(close).toHaveBeenCalledTimes(4);
-		expect(liquidFrameTextures.water).toBeNull();
-		expect(liquidFrameTextures.lavaFlow).toBeNull();
-		expect(liquidFrameTextures.lava).not.toBeNull();
+		expect(loader.getFluidTextures().water).toBeNull();
+		expect(loader.getFluidTextures().lavaFlow).toBeNull();
+		expect(loader.getFluidTextures().lava).not.toBeNull();
 		const dispose = vi.fn();
-		liquidFrameTextures.lava!.addEventListener("dispose", dispose);
+		loader.getFluidTextures().lava!.addEventListener("dispose", dispose);
 		loader.dispose();
 		expect(dispose).toHaveBeenCalledOnce();
-		expect(liquidFrameTextures.lava).toBeNull();
+		expect(loader.getFluidTextures().lava).toBeNull();
 	});
 
 	it("discards fluid textures that finish decoding after disposal", async () => {
@@ -155,11 +148,11 @@ describe("lava rendering", () => {
 		await started;
 		loader.dispose();
 		finish({ width: 1, height: 1, close: vi.fn() });
-		await load;
-		expect(Object.values(liquidFrameTextures).every((value) => value === null)).toBe(true);
+		await expect(load).rejects.toThrow("AssetLoader disposed");
+		expect(Object.values(loader.getFluidTextures()).every((value) => value === null)).toBe(true);
 	});
 
-	it("restores a cached loader's textures after another loader is disposed without decoding again", async () => {
+	it("isolates coexisting loaders and their materials even after one is disposed", async () => {
 		vi.stubGlobal(
 			"createImageBitmap",
 			vi.fn().mockResolvedValue({ width: 1, height: 1, close: vi.fn() })
@@ -178,19 +171,30 @@ describe("lava rendering", () => {
 			vi.spyOn(loader, "getResourceString").mockResolvedValue(undefined);
 		}
 		await loaders[0].buildTextureAtlas();
-		const first = liquidFrameTextures.lava;
+		const first = loaders[0].getFluidTextures().lava;
+		const firstMaterial = createFluidMaterial("lava", false, loaders[0].getFluidTextures());
 		const disposed = vi.fn();
 		first!.addEventListener("dispose", disposed);
 		await loaders[1].buildTextureAtlas();
-		expect(liquidFrameTextures.lava).not.toBe(first);
+		const second = loaders[1].getFluidTextures().lava;
+		const secondMaterial = createFluidMaterial("lava", false, loaders[1].getFluidTextures());
+		expect(second).not.toBe(first);
+		updateFluidTime(1);
+		expect(firstMaterial.uniforms.uTex.value).toBe(first);
+		expect(secondMaterial.uniforms.uTex.value).toBe(second);
 		loaders[1].dispose();
-		expect(liquidFrameTextures.lava).toBeNull();
+		updateFluidTime(2);
+		expect(firstMaterial.uniforms.uTex.value).toBe(first);
+		expect(secondMaterial.uniforms.uTex.value).toBeNull();
+		expect(loaders[1].getFluidTextures().lava).toBeNull();
 		await loaders[0].buildTextureAtlas();
-		expect(liquidFrameTextures.lava).toBe(first);
+		expect(loaders[0].getFluidTextures().lava).toBe(first);
 		expect(disposed).not.toHaveBeenCalled();
 		expect(createImageBitmap).toHaveBeenCalledTimes(2);
 		loaders[0].dispose();
 		expect(disposed).toHaveBeenCalledOnce();
+		firstMaterial.dispose();
+		secondMaterial.dispose();
 	});
 
 	it.each(["direct", "managed"])(
@@ -227,7 +231,7 @@ describe("lava rendering", () => {
 					);
 				}
 				await loader.buildTextureAtlas();
-				expect(fluidAnimationFrame(liquidFrameTextures.lava!, 0.15).x).toBe(
+				expect(fluidAnimationFrame(loader.getFluidTextures().lava!, 0.15).x).toBe(
 					frametime === 2 ? 1 : 0
 				);
 			}

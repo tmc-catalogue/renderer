@@ -1,10 +1,11 @@
 // Fluid surfaces with vanilla corner heights and shared water/waterlogged geometry.
-// Only exposed faces are emitted; water uses one transparent draw per schematic.
+// Only exposed faces are emitted; water is depth-sorted per mesh.
 import * as THREE from "three";
 import { FLUID_VERT, FLUID_FRAG } from "./FluidShaders";
 import { fluidAnimationFrame, hasFluidAnimation } from "./FluidAnimation";
 import { WATER_OPACITY } from "./WaterTextures";
 import type { BubbleCell } from "./BubbleColumns";
+import { installSurfaceSorting } from "./SurfaceSorting";
 
 export type GetBlock = (x: number, y: number, z: number) => string | null | undefined;
 export type FluidKind = "water" | "lava";
@@ -72,7 +73,8 @@ function classify(s: string | null | undefined): number {
 	if (name === "bubble_column") return K_WATER | 512 | (props.includes("drag=true") ? 1024 : 0);
 	if (props.indexOf("waterlogged=true") >= 0 || IMPLICIT_WATER.has(name)) return K_WATER;
 	const overlay = /^(?:glass|tinted_glass|.*_stained_glass|ice|frosted_ice|.*_leaves)$/.test(name);
-	return (NON_OCCLUDING.test(name) ? 0 : 1 << 8) | (overlay ? 2048 : 0);
+	const opaqueException = name === "packed_ice" || name === "blue_ice" || name === "grass_block";
+	return (!opaqueException && NON_OCCLUDING.test(name) ? 0 : 1 << 8) | (overlay ? 2048 : 0);
 }
 
 /** Palette-level early exit avoids scanning dry schematics for a fluid surface. */
@@ -135,7 +137,8 @@ export function buildFluidMeshes(
 	getBlock: GetBlock,
 	sx: number,
 	sy: number,
-	sz: number
+	sz: number,
+	textures?: FluidTextures
 ): FluidBuildResult {
 	const t0 = performance.now();
 	const n = sx * sy * sz;
@@ -146,7 +149,8 @@ export function buildFluidMeshes(
 	const bubbleCells: BubbleCell[] = [];
 	let cells = 0;
 	let hasWater = false,
-		hasLava = false;
+		hasLava = false,
+		hasTransparentNeighbors = false;
 
 	for (let y = 0; y < sy; y++) {
 		for (let z = 0; z < sz; z++) {
@@ -162,6 +166,7 @@ export function buildFluidMeshes(
 				kind[row + x] = k;
 				level[row + x] = (c >> 2) & 15;
 				occl[row + x] = (c >> 8) & 9; // bit 0: solid; bit 3: water overlay neighbor
+				if (c & 2048) hasTransparentNeighbors = true;
 				if (c & 512) bubbleCells.push({ x, y, z, downward: !!(c & 1024) });
 				if (k !== K_NONE) {
 					cells++;
@@ -191,7 +196,10 @@ export function buildFluidMeshes(
 	const buildKind = (k: number): THREE.Mesh[] => {
 		// Reserve for a surface, not the entire fluid volume. Buffers grow only
 		// when exposed faces need them (large lakes otherwise reserve hundreds of MB).
-		const est = Math.min(Math.max(cells, 1), 4096);
+		// Match the glass section batches in mixed scenes, preserving a single
+		// draw for ordinary water-only schematics and for all opaque lava.
+		const sectioned = k === K_WATER && hasTransparentNeighbors && (sx > 16 || sy > 16 || sz > 16);
+		const est = sectioned ? 8 : Math.min(Math.max(cells, 1), 4096);
 		const mkBld = () => ({
 			pos: new F32(est * 3 * 4 * 3),
 			face: new F32(est * 3 * 4),
@@ -200,7 +208,11 @@ export function buildFluidMeshes(
 			idx: new U32(est * 3 * 6),
 			vcount: 0,
 		});
-		const cur = mkBld();
+		let cur = mkBld();
+		const sections = new Map<number, ReturnType<typeof mkBld>>();
+		const sectionsX = Math.ceil(sx / 16),
+			sectionsZ = Math.ceil(sz / 16);
+		let currentSection = -1;
 
 		// per-cell state (set before emitting)
 		let fFace = 0,
@@ -336,6 +348,15 @@ export function buildFluidMeshes(
 						kind[i + sx] === k
 					)
 						continue;
+					if (sectioned) {
+						const section = ((y >> 4) * sectionsZ + (z >> 4)) * sectionsX + (x >> 4);
+						if (section !== currentSection) {
+							currentSection = section;
+							let buffer = sections.get(section);
+							if (!buffer) sections.set(section, (buffer = mkBld()));
+							cur = buffer;
+						}
+					}
 					const hC = above ? 1 : levelToHeight(level[i]);
 
 					// --- corner heights ---
@@ -434,6 +455,7 @@ export function buildFluidMeshes(
 			}
 		}
 
+		const mat = createFluidMaterial(KIND_NAME[k], false, textures);
 		const assemble = (b: {
 			pos: F32;
 			face: F32;
@@ -451,20 +473,34 @@ export function buildFluidMeshes(
 			geo.setIndex(new THREE.BufferAttribute(b.idx.view().slice(), 1));
 			geo.computeBoundingSphere();
 			geo.computeBoundingBox();
-			const mat = createFluidMaterial(KIND_NAME[k]);
 			const mesh = new THREE.Mesh(geo, mat);
 			mesh.name = `fluid:${KIND_NAME[k]}`;
 			mesh.userData.animatedSurface = ["uTex", "uFlowTex", "uOverlayTex"].some((key) =>
 				hasFluidAnimation(mat.uniforms[key].value)
 			);
 			mesh.frustumCulled = true;
-			if (k === K_WATER) mesh.renderOrder = 3; // after blocks, cutouts, and glass
 			mesh.onBeforeRender = () => updateMaterialTime(mat, performance.now() / 1000);
+			if (k === K_WATER) {
+				const centers = new Float32Array((b.vcount / 4) * 3);
+				const pos = b.pos.a;
+				for (let q = 0; q < b.vcount / 4; q++) {
+					for (let axis = 0; axis < 3; axis++) {
+						const i = q * 12 + axis;
+						centers[q * 3 + axis] = (pos[i] + pos[i + 3] + pos[i + 6] + pos[i + 9]) * 0.25;
+					}
+				}
+				installSurfaceSorting(mesh, centers);
+			}
 			return mesh;
 		};
 
-		const mesh = assemble(cur);
-		return mesh ? [mesh] : [];
+		const meshes: THREE.Mesh[] = [];
+		for (const batch of sectioned ? sections.values() : [cur]) {
+			const mesh = assemble(batch);
+			if (mesh) meshes.push(mesh);
+		}
+		if (meshes.length === 0) mat.dispose();
+		return meshes;
 	};
 
 	const meshes: THREE.Mesh[] = [];
@@ -478,21 +514,23 @@ export function buildFluidMeshes(
 // Material
 // ---------------------------------------------------------------------------
 const live = new Set<THREE.ShaderMaterial>();
+const sources = new WeakMap<THREE.ShaderMaterial, FluidTextures>();
 let textureSource: FluidTextures | null = null;
 
-/** Optional explicit source; otherwise `globalThis.liquidFrameTextures` is used lazily. */
+/** Compatibility default for standalone callers. Explicitly sourced meshes are unaffected. */
 export function setFluidTextures(src: FluidTextures | null): void {
 	textureSource = src;
 	for (const m of live) {
-		m.userData.bound = false;
-		m.uniforms.uHasTex.value = 0;
-		m.uniforms.uTex.value = null;
-		m.uniforms.uFlowTex.value = null;
+		if (sources.has(m)) continue;
 		tryBind(m);
 	}
 }
 
-export function createFluidMaterial(kind: FluidKind, _logged = false): THREE.ShaderMaterial {
+export function createFluidMaterial(
+	kind: FluidKind,
+	_logged = false,
+	textures?: FluidTextures
+): THREE.ShaderMaterial {
 	const water = kind === "water";
 	// convertLinearToSRGB: the pipeline is sRGB end-to-end (sRGB texels in, sRGB
 	// framebuffer out, no conversions) — the Color constructor converts hex to
@@ -527,7 +565,7 @@ export function createFluidMaterial(kind: FluidKind, _logged = false): THREE.Sha
 	});
 	mat.userData.kind = kind;
 	mat.userData.fluidAlpha = mat.uniforms.uAlpha.value;
-	mat.userData.bound = false;
+	if (textures) sources.set(mat, textures);
 	live.add(mat);
 	mat.addEventListener("dispose", () => live.delete(mat));
 	tryBind(mat);
@@ -535,7 +573,7 @@ export function createFluidMaterial(kind: FluidKind, _logged = false): THREE.Sha
 }
 
 function tryBind(m: THREE.ShaderMaterial): void {
-	const src: FluidTextures | undefined = textureSource ?? (globalThis as any).liquidFrameTextures;
+	const src = sources.get(m) ?? textureSource;
 	const water = m.userData.kind === "water";
 	const tex = src?.[m.userData.kind as FluidKind] ?? null;
 	const flow = (water ? src?.waterFlow : src?.lavaFlow) ?? tex;
